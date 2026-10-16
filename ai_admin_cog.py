@@ -62,6 +62,7 @@ ALLOWED_ROLE_IDS = _ids("ALLOWED_ROLE_IDS")
 AI_CHANNEL_IDS = _ids("AI_CHANNEL_IDS")
 ACTION_LOG_ID = int(os.getenv("AI_ACTION_LOG_ID", "0") or 0)
 DM_FOOTER = os.getenv("DM_FOOTER", "")
+VERIFY_CHECK_CHANNEL_ID = int(os.getenv("VERIFY_CHECK_CHANNEL_ID", "0") or 0)
 
 A = discord.AuditLogAction
 MISSING = object()
@@ -657,12 +658,14 @@ class AIAdmin(commands.Cog):
         if err:
             return err
         uid = str(m.id)
-        chans = [
-            c for c in guild.text_channels
-            if "verify-check" in c.name.lower() and c.permissions_for(guild.me).read_message_history
-        ]
+        if VERIFY_CHECK_CHANNEL_ID:
+            chans = [c for c in guild.text_channels if c.id == VERIFY_CHECK_CHANNEL_ID]
+        else:
+            chans = [c for c in guild.text_channels if "verify-check" in c.name.lower()]
         if not chans:
-            return {"error": "No readable channel with 'verify-check' in its name."}
+            return {"error": "verify-check channel not found - set VERIFY_CHECK_CHANNEL_ID in Railway."}
+        if not chans[0].permissions_for(guild.me).read_message_history:
+            return {"error": f"I can't read message history in #{chans[0].name} - give the bot that permission."}
         cards = []
         scanned = 0
         for c in chans:
