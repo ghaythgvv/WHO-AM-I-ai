@@ -351,7 +351,10 @@ class AIAdmin(commands.Cog):
             "short and clear. ALWAYS use tools to get facts about who did what - never guess. "
             "The audit log only goes back 45 days; say so if the answer may be older. "
             "Show times as Discord timestamps like <t:UNIX:R> using the unix value from the tool. "
-            "Mention people by name (and id if useful). For 'who verified who' use audit_search kind=verification. "
+            "Mention people by name (and id if useful). For 'who verified who' FIRST call search_logs with "
+            "channel_hint='verify-check' and the member's name or id, then answer with the person in the 'Checked by' "
+            "field of the card (the staff member who verified). Only if no card is found use audit_search kind=verification, "
+            "and if the audit log shows the bot ELITE SYSTEM, say the staff checker is unknown. "
             "For 'unmute all' / 'unmute everyone' call unmute_all; for 'who is muted' call list_muted. "
             "For actions (dm, kick, ban, timeout, roles, unmute_all) call the matching tool; destructive ones ask the "
             "staff member for a button confirmation by themselves - after the tool result just report what happened. "
@@ -629,7 +632,11 @@ class AIAdmin(commands.Cog):
                         {
                             "channel": c.name,
                             "unix": int(m.created_at.timestamp()),
-                            "text": blob[:400],
+                            "text": re.sub(
+                                r"<@!?(\d+)>",
+                                lambda x: "@" + self._name(guild, int(x.group(1)))["name"],
+                                blob,
+                            )[:600],
                             "url": m.jump_url,
                         }
                     )
