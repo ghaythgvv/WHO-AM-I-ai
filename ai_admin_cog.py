@@ -112,7 +112,8 @@ TOOLS = [
         "description": (
             "Full-text search inside the server's log channels (other bots' logs like -KICK, -TIMEOUT, "
             "-TICKET, -RAIDPROTECT-LOGS...). Use when the audit log is not enough or the user says "
-            "'search/cherche for something'. channel_hint filters channels by name part, e.g. 'ticket'."
+            "'search/cherche for something'. channel_hint filters channels by name part, e.g. 'ticket'. "
+            "If the query is a member name, the member's id is searched too."
         ),
         "input_schema": {
             "type": "object",
@@ -609,11 +610,21 @@ class AIAdmin(commands.Cog):
         else:
             chans = [c for c in chans if "log" in c.name.lower() or (c.category and "log" in c.category.name.lower())]
         tokens = query.lower().split()
+        # if the query is a member, also search for their id (cards show users as <@id>)
+        ids = []
+        try:
+            found = await self._find_members(guild, query)
+            if len(found) == 1:
+                ids = [str(found[0].id)]
+        except Exception:
+            pass
         out = []
         for c in chans[:20]:
             async for m in c.history(limit=150):
                 blob = (m.content + " " + " ".join(_embed_text(e) for e in m.embeds)).strip()
-                if tokens and all(t in blob.lower() for t in tokens):
+                low = blob.lower()
+                hit = any(i in blob for i in ids) or (tokens and all(t in low for t in tokens))
+                if hit:
                     out.append(
                         {
                             "channel": c.name,
