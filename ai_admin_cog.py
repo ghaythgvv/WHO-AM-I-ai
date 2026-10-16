@@ -126,6 +126,14 @@ TOOLS = [
         },
     },
     {
+        "name": "who_verified",
+        "description": (
+            "Find which STAFF member verified a member, by reading the verification card in the verify-check "
+            "channel (the 'Checked by' field). ALWAYS use this for 'who verified X' questions."
+        ),
+        "input_schema": {"type": "object", "properties": {"member": {"type": "string"}}, "required": ["member"]},
+    },
+    {
         "name": "member_info",
         "description": "Info about one member: roles, join date, account age, timeout state.",
         "input_schema": {"type": "object", "properties": {"member": {"type": "string"}}, "required": ["member"]},
@@ -351,10 +359,9 @@ class AIAdmin(commands.Cog):
             "short and clear. ALWAYS use tools to get facts about who did what - never guess. "
             "The audit log only goes back 45 days; say so if the answer may be older. "
             "Show times as Discord timestamps like <t:UNIX:R> using the unix value from the tool. "
-            "Mention people by name (and id if useful). For 'who verified who' FIRST call search_logs with "
-            "channel_hint='verify-check' and the member's name or id, then answer with the person in the 'Checked by' "
-            "field of the card (the staff member who verified). Only if no card is found use audit_search kind=verification, "
-            "and if the audit log shows the bot ELITE SYSTEM, say the staff checker is unknown. "
+            "Mention people by name (and id if useful). For 'who verified who' ALWAYS call who_verified (it reads the "
+            "'Checked by' field of the verification card). Never use audit_search for that question unless who_verified "
+            "found no card. "
             "For 'unmute all' / 'unmute everyone' call unmute_all; for 'who is muted' call list_muted. "
             "For actions (dm, kick, ban, timeout, roles, unmute_all) call the matching tool; destructive ones ask the "
             "staff member for a button confirmation by themselves - after the tool result just report what happened. "
@@ -643,6 +650,46 @@ class AIAdmin(commands.Cog):
                     if len(out) >= max_results:
                         return {"searched_channels": len(chans), "results": out}
         return {"searched_channels": min(len(chans), 20), "results": out}
+
+    async def t_who_verified(self, ctx, member):
+        guild = ctx["guild"]
+        m, err = await self._one_member(guild, member)
+        if err:
+            return err
+        uid = str(m.id)
+        chans = [
+            c for c in guild.text_channels
+            if "verify-check" in c.name.lower() and c.permissions_for(guild.me).read_message_history
+        ]
+        if not chans:
+            return {"error": "No readable channel with 'verify-check' in its name."}
+        cards = []
+        scanned = 0
+        for c in chans:
+            async for msg in c.history(limit=1000):
+                scanned += 1
+                for e in msg.embeds:
+                    text = _embed_text(e)
+                    if uid not in text:
+                        continue
+                    ids = []
+                    for f in e.fields:
+                        if "checked" in f.name.lower():
+                            ids += re.findall(r"\d{15,20}", f.value)
+                    if not ids:
+                        mm = re.search(r"checked by\D{0,15}(\d{15,20})", text, re.I)
+                        if mm:
+                            ids = [mm.group(1)]
+                    cards.append(
+                        {
+                            "checked_by": [self._name(guild, int(i)) for i in ids],
+                            "unix": int(msg.created_at.timestamp()),
+                            "url": msg.jump_url,
+                        }
+                    )
+        if not cards:
+            return {"found": False, "channels": [c.name for c in chans], "messages_scanned": scanned}
+        return {"found": True, "cards_newest_first": cards[:5]}
 
     async def t_member_info(self, ctx, member):
         m, err = await self._one_member(ctx["guild"], member)
