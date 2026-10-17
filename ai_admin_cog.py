@@ -753,7 +753,9 @@ class AIAdmin(commands.Cog):
             "understand them all). If they EXPLICITLY ask you to speak another language (for example Tunisian, Arabic or "
             "French), switch to it and keep using it until they ask for English again. Text you post or DM on their behalf "
             "stays exactly as they wrote it. "
-            "STYLE: short and direct, Discord markdown, no tables, no filler, lists of max ~15 lines (say '+N more'). "
+            "STYLE: short and direct, Discord markdown, no filler, lists of max ~15 lines (say '+N more'). "
+            "NEVER use markdown tables (Discord can't render them, they show as raw | lines) - use one short line per item, "
+            "like '- **Mod** - 3 bans', and write target names as plain names. "
             "Times as <t:UNIX:R> using the unix value from the tool. Mention people by name (id if useful). "
             "CONTEXT: 'here', 'this channel', 'that channel', 'this chat' = the current channel unless another one is named - "
             "never ask which channel in that case. 'him/her/them' = the person discussed last or the replied-to author. "
@@ -1502,11 +1504,17 @@ class AIAdmin(commands.Cog):
             extra = {"name": None if nm is MISSING else nm}
 
         mod_id = entry.user.id if entry.user else entry.user_id
-        tgt_id = entry.target.id if getattr(entry, "target", None) is not None and hasattr(entry.target, "id") else None
+        tgt = getattr(entry, "target", None)
+        tgt_id = tgt.id if tgt is not None and hasattr(tgt, "id") else None
+        target = self._name(guild, tgt_id) if tgt_id else None
+        if target and target["name"] == "unknown":  # banned / kicked users are no longer members: use the entry's own user
+            nm = getattr(tgt, "global_name", None) or getattr(tgt, "name", None)
+            if nm:
+                target["name"] = nm
         return {
             "unix": int(entry.created_at.timestamp()),
             "moderator": self._name(guild, mod_id) if mod_id else None,
-            "target": self._name(guild, tgt_id) if tgt_id else None,
+            "target": target,
             "reason": entry.reason,
             **extra,
         }
@@ -1544,6 +1552,18 @@ class AIAdmin(commands.Cog):
             per_mod[d["moderator"]["name"] if d["moderator"] else "unknown"] += 1
             if len(rows) < limit:
                 rows.append(d)
+        cache = {}
+        for d in rows:  # names Discord didn't hand us (users who left / were banned long ago): look them up once
+            t = d.get("target")
+            if t and t["name"] == "unknown":
+                uid = int(t["id"])
+                if uid not in cache:
+                    try:
+                        u = await self.bot.fetch_user(uid)
+                        cache[uid] = u.global_name or u.name
+                    except discord.HTTPException:
+                        cache[uid] = f"user {uid}"
+                t["name"] = cache[uid]
         return {
             "kind": kind,
             "days": days,
