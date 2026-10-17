@@ -160,12 +160,7 @@ HELP_TEXT = (
     "Risky actions always ask first: press the button or type `yes` / `no`.\n"
     "Everybody can chat with me, but only the owner and roles above mine can give me tasks."
 )
-MEMBER_HELP = (
-    "**ELITE SYSTEM** - ask me anything: `!ask ...`, `/ask`, @mention me or reply to my messages. "
-    "I answer in English by default, you can write to me in any language.\n"
-    "I can chat and answer questions, but I can't do anything on the server for you - "
-    "only the owner and roles above mine can give me tasks."
-)
+MEMBER_HELP = "Hey! How can I help you?"  # members only see this - never the admin command list
 MEMBER_ERROR = "I can't answer right now - try again in a moment."
 NO_TASKS = "Only the owner and roles above mine can give me tasks."
 _HELP_RE = re.compile(r"^\s*(?:help|commands|what can you do\??|how (?:do i|to) use (?:you|this))\s*$", re.I)
