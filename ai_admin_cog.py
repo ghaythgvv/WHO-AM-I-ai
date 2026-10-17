@@ -48,6 +48,7 @@ from discord import app_commands
 from discord.ext import commands
 
 MODEL = os.getenv("AI_MODEL", "openai/gpt-oss-120b")
+FALLBACK_MODEL = os.getenv("AI_FALLBACK_MODEL", "openai/gpt-oss-20b")  # used when the main model hits its free limit
 REASONING = os.getenv("AI_REASONING", "low")  # low = fastest, medium/high = smarter
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1")
 AI_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("AI_API_KEY", "")
@@ -70,6 +71,21 @@ A = discord.AuditLogAction
 REFUSAL_RE = re.compile(
     r"^\s*(i['’]?m sorry|i am sorry|sorry|i can['’]?t|i cannot|i couldn['’]?t|something broke|i didn['’]?t understand)", re.I
 )
+BASE_TOOLS = {"audit_search", "search_logs", "who_verified", "member_info", "list_members", "server_overview", "send_message"}
+TOOL_KEYWORDS = [  # (words in the message, extra tools to offer) - fewer tools = fewer tokens = fewer rate limits
+    (("mute", "unmute", "timeout", "time out", "deafen", "silence"), {"timeout_member", "list_muted", "unmute_all", "voice_action"}),
+    (("kick",), {"kick_member"}),
+    (("ban", "unban"), {"ban_member", "unban_user"}),
+    (("role", "rank"), {"change_role", "bulk_role", "create_role", "delete_role", "list_roles"}),
+    (("channel", "delete", "purge", "wipe", "clear", "nuke", "lock", "unlock", "slowmode", "rename", "create", "category", "topic"),
+     {"list_channels", "purge_messages", "wipe_channel", "create_channel", "delete_channel", "edit_channel", "lock_channel", "read_channel"}),
+    (("message", "msg", "said", "write", "wrote", "search", "chat", "read", "find"), {"search_messages", "read_channel", "list_channels"}),
+    (("dm ", "direct"), {"dm_member"}),
+    (("nick", "rename"), {"set_nickname"}),
+    (("join", "new member", "recent"), {"recent_joins"}),
+    (("voice", "vc", "move", "disconnect", "kick from"), {"voice_action", "list_muted"}),
+    (("who is", "who's", "whos", "goat", "best", "top", "active", "server"), {"list_roles", "list_channels", "search_messages"}),
+]
 CONFIRM_TOOLS = {
     "kick_member", "ban_member", "timeout_member", "change_role", "unmute_all", "purge_messages",
     "wipe_channel", "delete_channel", "delete_role", "lock_channel", "unban_user", "bulk_role",
@@ -479,7 +495,7 @@ class AIAdmin(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.ai = AsyncOpenAI(api_key=AI_API_KEY or 'missing', base_url=AI_BASE_URL)
-        self.history = defaultdict(lambda: deque(maxlen=8))  # per channel, text only
+        self.history = defaultdict(lambda: deque(maxlen=6))  # per channel, text only
         self.locks = defaultdict(_NoLock)
         self.last_say = {}  # per channel: last channel/person the bot posted to
 
@@ -598,11 +614,12 @@ class AIAdmin(commands.Cog):
         hist = self.history[message.channel.id]
         msgs = [{"role": "system", "content": self._system(message)}] + list(hist) + [{"role": "user", "content": text}]
         final = "I couldn't finish that, try rephrasing."
+        tools = self._tools_for(text)
         used_tools = nudged = False
         done_calls = set()
         try:
             for _ in range(8):
-                resp = await self._complete(msgs)
+                resp = await self._complete(msgs, tools)
                 msg = resp.choices[0].message
                 if not msg.tool_calls:
                     final = (msg.content or "").strip() or final
@@ -655,7 +672,7 @@ class AIAdmin(commands.Cog):
                         {
                             "role": "tool",
                             "tool_call_id": tc.id,
-                            "content": json.dumps(out, ensure_ascii=False, default=str)[:5000],
+                            "content": json.dumps(out, ensure_ascii=False, default=str)[:3500],
                         }
                     )
                 if was_cancelled:
@@ -815,21 +832,42 @@ class AIAdmin(commands.Cog):
         note = " (I couldn't tell who to tag - say `tag <name>`)" if unsure else ""
         return f"Sent in **{ch.name}**" + (" and tagged them." if tag else ".") + note
 
-    async def _complete(self, msgs):
-        for attempt in range(2):
+    def _tools_for(self, text):
+        """only send the tools this message can need (the full list is ~7k tokens and burns the free limit)"""
+        low = text.lower()
+        names = set(BASE_TOOLS)
+        hit = False
+        for words, extra in TOOL_KEYWORDS:
+            if any(w in low for w in words):
+                names |= extra
+                hit = True
+        non_latin = any(ord(ch) > 0x2FF and ch.isalpha() for ch in text)
+        if non_latin or (not hit and len(low.split()) > 14):
+            return OPENAI_TOOLS  # other languages / long requests: offer everything
+        return [t for t in OPENAI_TOOLS if t["function"]["name"] in names]
+
+    async def _complete(self, msgs, tools=None):
+        model, switched, plain = MODEL, False, False
+        for attempt in range(4):
             try:
-                extra = {"extra_body": {"reasoning_effort": REASONING}} if attempt == 0 and "gpt-oss" in MODEL else {}
+                extra = {"extra_body": {"reasoning_effort": REASONING}} if ("gpt-oss" in model and not plain) else {}
                 return await self.ai.chat.completions.create(
-                    model=MODEL,
-                    max_tokens=1500,
+                    model=model,
+                    max_tokens=1200,
                     messages=msgs,
-                    tools=OPENAI_TOOLS,
+                    tools=tools or OPENAI_TOOLS,
                     tool_choice="auto",
                     **extra,
                 )
-            except openai.BadRequestError:  # the model sometimes writes a broken tool call - retry once
-                if attempt == 1:
+            except openai.RateLimitError:
+                # limits are per model: if the main one is used up, the backup model still has room
+                if switched or not FALLBACK_MODEL or FALLBACK_MODEL == model:
                     raise
+                model, switched = FALLBACK_MODEL, True
+            except openai.BadRequestError:  # the model sometimes writes a broken tool call - retry
+                if attempt >= 3:
+                    raise
+                plain = True
                 await asyncio.sleep(1)
 
     async def _dispatch(self, name, args, ctx):
