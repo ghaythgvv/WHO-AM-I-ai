@@ -652,10 +652,12 @@ class AIAdmin(commands.Cog):
 
     async def _quick_say(self, ctx, text):
         """'say X in <channel> and tag <member>' - done directly, no AI (instant, never refused)."""
-        m = re.match(r"^\s*(?:say|send|write|tell)\s+(.+?)\s*$", text, re.I | re.S)
+        m = re.match(r"^\s*(say|send|write|tell|text|type|post)\s+(.+?)\s*$", text, re.I | re.S)
         if not m:
             return None
-        rest = m.group(1)
+        verb, rest = m.group(1).lower(), m.group(2)
+        # filler like "syrox to say to bcba ..." / "to say ..."
+        rest = re.sub(r"^(?:\S+\s+)?to\s+(?:say|write|type|post)\s+(?:to\s+)?", "", rest, count=1, flags=re.I)
         g = ctx["guild"]
         last = self.last_say.get(ctx["channel"].id) or {}
         tag_text = None
@@ -673,7 +675,7 @@ class AIAdmin(commands.Cog):
             if found is not None and hasattr(found, "send"):
                 ch, body = found, c.group(1).strip()
         follow_up = False
-        if ch is None and last.get("channel"):  # follow-up: same place as last time
+        if ch is None and last.get("channel") and verb in ("say", "text", "type", "post"):  # follow-up: same place
             ch, follow_up = g.get_channel(last["channel"]), True
         if ch is None or not hasattr(ch, "send") or not body.strip():
             return None
