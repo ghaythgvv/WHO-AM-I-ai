@@ -153,7 +153,7 @@ HELP_TEXT = (
     "**Look things up:** `who kicked Ahmed` - `who muted who today` - `who verified Sara` - `who is muted` - "
     "`who is in voice` - `most active members` - `search the logs for raid` - `info about Ali`\n"
     "**Act:** `timeout Ali 30 min spamming` - `kick / ban / unban X` - `give Ali the Mod role` - "
-    "`dm Omar your ticket is closed` - `say hi in general and tag Ali` - `unmute all`\n"
+    "`dm Omar your ticket is closed` - `say hi in general and tag Ali` - `unmute all` (voice mute) - `remove all timeouts`\n"
     "**Channels:** `delete 50 messages here` - `delete all messages in test` - `lock #general` - "
     "`create voice channel Lounge` - `slowmode 10 seconds in chat`\n"
     "**Automatic:** `tag Staff and UT Staff in #bump every time someone bumps` - `bump alert status` - `bump alert off`\n"
@@ -166,12 +166,18 @@ NO_TASKS = "Only the owner and roles above mine can give me tasks."
 _HELP_RE = re.compile(r"^\s*(?:help|commands|what can you do\??|how (?:do i|to) use (?:you|this))\s*$", re.I)
 _MUTED_RE = re.compile(
     r"^\s*(?:(?:who(?:\s+is|\s+are|'s|s))|(?:list|show(?:\s+me)?))\s+(?:all\s+)?(?:the\s+)?(?:currently\s+|right\s+now\s+)?"
-    r"(?:muted|timed[\s-]*out)(?:\s+(?:members?|people|users?|right\s+now|now))*\s*\??\s*$",
+    r"(?P<k>muted?|timed[\s-]*out|time[\s-]*out)(?:\s+(?:members?|people|users?|in\s+voice|right\s+now|now))*\s*\??\s*$",
     re.I,
 )
 _UNMUTE_RE = re.compile(
     r"^\s*(?:(?:please|pls|plz)\s+)?unmute\s+(?:all|everyone|everybody|every\s*one)"
     r"(?:\s+(?:the\s+)?(?:members?|people|users?))?(?:\s+(?:in\s+)?(?P<w>voice|timeouts?))?\s*$",
+    re.I,
+)
+_UNTIMEOUT_RE = re.compile(
+    r"^\s*(?:(?:please|pls|plz)\s+)?(?:un[\s-]?time[\s-]?out\s+(?:all|everyone|everybody)(?:\s+members?)?"
+    r"|(?:remove|clear|end|cancel)\s+(?:all\s+|every\s*)?(?:the\s+)?time[\s-]?outs?"
+    r"(?:\s+(?:of|from|for)\s+(?:all|everyone|everybody)(?:\s+members?)?)?)\s*$",
     re.I,
 )
 _DEL_PRE = r"^\s*(?:(?:please|pls|plz)\s+)?"
@@ -339,9 +345,13 @@ TOOLS = [
     _tool("unban_user", "Unban a user by name or id (button confirm).", {"user": _s(), "reason": _s()}, ["user"]),
     _tool("bulk_role", "Add/remove a role for MANY members: everyone, or only members who have from_role (button confirm).",
           {"role": _s(), "action": _s(enum=["add", "remove"]), "from_role": _s()}, ["role", "action"]),
-    _tool("list_muted", "Members muted RIGHT NOW: server-muted/deafened in voice and/or timed out."),
+    _tool("list_muted",
+          "Who is muted RIGHT NOW. scope=voice (DEFAULT, what 'who is muted / mute' means): members server-muted or deafened "
+          "in voice. scope=timeout: members who are timed out. scope=all: both - only when they ask for both.",
+          {"scope": _s(enum=["voice", "timeout", "all"])}),
     _tool("unmute_all",
-          "Unmute EVERY member: removes server mute/deafen in voice and timeouts. scope: all (default) / voice / timeout (button confirm).",
+          "Voice mute and timeout are SEPARATE. scope=voice (DEFAULT, 'unmute all'): remove server mute/deafen in voice ONLY. "
+          "scope=timeout ('remove all timeouts'): remove timeouts ONLY. scope=all: both - only when they ask for both (button confirm).",
           {"scope": _s(enum=["all", "voice", "timeout"])}),
     _tool("list_voice", "Who is in which voice channel right now, with mute/deafen state."),
     _tool("top_active",
@@ -432,10 +442,15 @@ def _is_here(q):
     )
 
 
-def _fmt_muted(r):
+def _fmt_muted(r, scope="voice"):
     v, t = r["voice_muted_or_deafened"], r["timed_out"]
+    hint = ""  # mute and timeout are separate: a mute answer never mentions timeouts (and the other way round)
     if not v and not t:
-        return "Nobody is muted right now."
+        if scope == "timeout":
+            return "Nobody is timed out right now."
+        if scope == "all":
+            return "Nobody is muted or timed out right now."
+        return "Nobody is muted in voice right now." + hint
     lines = []
     if v:
         parts = []
@@ -451,7 +466,7 @@ def _fmt_muted(r):
             + ", ".join(f"{x['name']} (ends <t:{x['until_unix']}:R>)" for x in t)
             + (f" +{more} more" if more > 0 else "")
         )
-    return "\n".join(lines)
+    return "\n".join(lines) + hint
 
 
 class Confirm(discord.ui.View):
@@ -763,7 +778,9 @@ class AIAdmin(commands.Cog):
             "FACTS: for anything about who did what ALWAYS use tools - never guess. The audit log only goes back 45 days "
             "(say so if the answer may be older). "
             "'who verified X' -> who_verified (reads the 'Checked by' field); audit_search only if it finds no card. "
-            "'who is muted' -> list_muted. 'unmute all' -> unmute_all. 'who is in voice' -> list_voice. "
+            "'who is muted / who is mute' -> list_muted with scope voice (ONLY people muted/deafened in voice - never list timeouts "
+            "unless they say timed out / timeout); 'who is timed out' -> list_muted with scope timeout; both -> scope all. 'unmute all' -> unmute_all with scope voice (mute only, leave timeouts alone); 'remove all timeouts' -> unmute_all with "
+            "scope timeout; both -> scope all. 'who is in voice' -> list_voice. "
             "'goat / best / top / most active members' -> top_active (say it is based on recent message activity). "
             "ACTIONS: call the matching tool and do what the staff member asks. Destructive tools show a confirmation button "
             "by themselves - never ask for confirmation in text. 'Delete N messages' -> purge_messages ONCE. "
@@ -820,6 +837,7 @@ class AIAdmin(commands.Cog):
             self._quick_help(text)
             or await self._quick_muted(ctx, text)
             or await self._quick_unmute(ctx, text)
+            or await self._quick_untimeout(ctx, text)
             or await self._quick_delete(ctx, text)
             or await self._quick_say(ctx, text)
         )  # instant, no AI call needed
@@ -1062,17 +1080,24 @@ class AIAdmin(commands.Cog):
         return HELP_TEXT if _HELP_RE.match(text) else None
 
     async def _quick_muted(self, ctx, text):
-        if not _MUTED_RE.match(text):
+        m = _MUTED_RE.match(text)
+        if not m:
             return None
-        return _fmt_muted(await self.t_list_muted(ctx))
+        scope = "timeout" if m.group("k").lower().startswith("time") else "voice"  # "mute" = voice, "timed out" = timeout
+        return _fmt_muted(await self.t_list_muted(ctx, scope=scope), scope)
 
     async def _quick_unmute(self, ctx, text):
         m = _UNMUTE_RE.match(text)
         if not m:
             return None
         w = (m.group("w") or "").lower()
-        scope = "voice" if w == "voice" else "timeout" if w.startswith("timeout") else "all"
+        scope = "timeout" if w.startswith("timeout") else "voice"  # "unmute" = voice mute only
         return self._quick_result(await self._dispatch("unmute_all", {"scope": scope}, ctx))
+
+    async def _quick_untimeout(self, ctx, text):
+        if not _UNTIMEOUT_RE.match(text):
+            return None
+        return self._quick_result(await self._dispatch("unmute_all", {"scope": "timeout"}, ctx))
 
     async def _quick_delete(self, ctx, text):
         """'delete all messages in X' -> wipe_channel, 'delete 50 messages in X' -> purge (instant, no AI)"""
@@ -1921,38 +1946,56 @@ class AIAdmin(commands.Cog):
         timed = [m for m in guild.members if m.is_timed_out()]
         return voice, timed
 
-    async def t_list_muted(self, ctx):
+    async def t_list_muted(self, ctx, scope="voice"):
+        if scope not in ("voice", "timeout", "all"):
+            scope = "voice"
         voice, timed = self._muted_sets(ctx["guild"])
+        show_v, show_t = scope in ("voice", "all"), scope in ("timeout", "all")
         return {
+            "scope": scope,
             "voice_muted_or_deafened": [
                 {"id": str(m.id), "name": m.display_name, "muted": m.voice.mute, "deafened": m.voice.deaf} for m in voice[:50]
-            ],
+            ] if show_v else [],
             "timed_out": [
                 {"id": str(m.id), "name": m.display_name, "until_unix": int(m.timed_out_until.timestamp())} for m in timed[:50]
-            ],
+            ] if show_t else [],
             "voice_count": len(voice),
             "timeout_count": len(timed),
         }
 
-    async def t_unmute_all(self, ctx, scope="all"):
+    async def t_unmute_all(self, ctx, scope="voice"):
         guild = ctx["guild"]
+        if scope not in ("voice", "timeout", "all"):
+            scope = "voice"
         voice, timed = self._muted_sets(guild)
         if scope == "voice":
             timed = []
         elif scope == "timeout":
             voice = []
         if not voice and not timed:
-            return {"ok": True, "message": "Nobody is muted right now.", "summary": "Nobody is muted right now."}
-        if not await self._confirm(
-            ctx, f"UNMUTE ALL\nVoice mute/deafen to remove: **{len(voice)}**\nTimeouts to remove: **{len(timed)}**"
-        ):
+            msg = {"voice": "Nobody is muted in voice right now.", "timeout": "Nobody is timed out right now."}.get(
+                scope, "Nobody is muted or timed out right now."
+            )
+            return {"ok": True, "message": msg, "summary": msg}
+        title = {"voice": "UNMUTE ALL (voice)", "timeout": "REMOVE ALL TIMEOUTS"}.get(scope, "UNMUTE ALL + REMOVE ALL TIMEOUTS")
+        lines = []
+        if scope in ("voice", "all"):
+            lines.append(f"Voice mute/deafen to remove: **{len(voice)}**")
+        if scope in ("timeout", "all"):
+            lines.append(f"Timeouts to remove: **{len(timed)}**")
+        if not await self._confirm(ctx, title + "\n" + "\n".join(lines)):
             return {"cancelled": True}
         reason = f"AI unmute all, by {ctx['author']}"
         done_v, fail_v = await self._each(voice, lambda m: m.edit(mute=False, deafen=False, reason=reason))
         done_t, fail_t = await self._each(timed, lambda m: m.timeout(None, reason=reason))
         failed = fail_v + fail_t
-        await self._log_action(ctx, f"unmute all - voice: {done_v}, timeouts removed: {done_t}, failed: {len(failed)}")
-        summary = f"Unmuted everyone: voice **{done_v}**, timeouts removed **{done_t}**."
+        await self._log_action(ctx, f"{title.lower()} - voice: {done_v}, timeouts removed: {done_t}, failed: {len(failed)}")
+        if scope == "voice":
+            summary = f"Unmuted **{done_v}** member(s) in voice."
+        elif scope == "timeout":
+            summary = f"Removed **{done_t}** timeout(s)."
+        else:
+            summary = f"Done: voice unmuted **{done_v}**, timeouts removed **{done_t}**."
         if failed:
             summary += f" Failed for {len(failed)}: {', '.join(failed[:10])} (check the bot's role position)."
         return {"ok": True, "voice_unmuted": done_v, "timeouts_removed": done_t, "failed": failed[:20], "summary": summary}
