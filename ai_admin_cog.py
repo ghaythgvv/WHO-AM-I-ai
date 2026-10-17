@@ -350,7 +350,7 @@ TOOLS = [
           {"role": _s(), "action": _s(enum=["add", "remove"]), "from_role": _s()}, ["role", "action"]),
     _tool("list_muted",
           "Who is muted RIGHT NOW. scope=voice (DEFAULT, what 'who is muted / mute' means): members server-muted or deafened "
-          "in voice PLUS members holding the server's 'Muted' role (they can be outside voice). scope=timeout: members who are timed out. scope=all: both - only when they ask for both.",
+          "in voice, members who are server-muted but NOT in voice, PLUS members holding the server's 'Muted' role. scope=timeout: members who are timed out. scope=all: both - only when they ask for both.",
           {"scope": _s(enum=["voice", "timeout", "all"])}),
     _tool("unmute_all",
           "Voice mute and timeout are SEPARATE. scope=voice (DEFAULT, 'unmute all'): remove server mute/deafen in voice ONLY. "
@@ -446,13 +446,14 @@ def _is_here(q):
 
 
 def _fmt_muted(r, scope="voice"):
-    v, t, rl = r["voice_muted_or_deafened"], r["timed_out"], r.get("muted_by_role", [])
-    if not v and not t and not rl:  # mute and timeout are separate: a mute answer never mentions timeouts (and vice versa)
+    v, t, rl, away = r["voice_muted_or_deafened"], r["timed_out"], r.get("muted_by_role", []), r.get("muted_outside_voice", [])
+    if not v and not t and not rl and not away:  # mute and timeout are separate: a mute answer never mentions timeouts
         if scope == "timeout":
             return "Nobody is timed out right now."
-        if scope == "all":
-            return "Nobody is muted or timed out right now."
-        return "Nobody is muted right now."
+        out = "Nobody is muted or timed out right now." if scope == "all" else "Nobody is muted right now."
+        if scope != "timeout" and not r.get("mute_role_names"):
+            out += " (I found no 'Muted' role - if your server uses one, set `MUTE_ROLE_IDS` in Railway.)"
+        return out
     lines = []
     if v:
         parts = []
@@ -461,6 +462,16 @@ def _fmt_muted(r, scope="voice"):
             parts.append(f"{x['name']} ({'/'.join(flags)})")
         more = r["voice_count"] - len(v)
         lines.append(f"**Muted in voice ({r['voice_count']}):** " + ", ".join(parts) + (f" +{more} more" if more > 0 else ""))
+    if away:
+        more = r["outside_voice_count"] - len(away)
+        parts = []
+        for x in away:
+            flags = [f for f, on in (("muted", x["muted"]), ("deafened", x["deafened"])) if on]
+            parts.append(f"{x['name']} ({'/'.join(flags)})")
+        lines.append(
+            f"**Server-muted, not in voice ({r['outside_voice_count']}):** " + ", ".join(parts)
+            + (f" +{more} more" if more > 0 else "")
+        )
     if rl:
         more = r["mute_role_count"] - len(rl)
         label = ", ".join(r.get("mute_role_names") or ["mute role"])
@@ -1970,6 +1981,37 @@ class AIAdmin(commands.Cog):
         ids = {r.id for r in roles}
         return [m for m in guild.members if any(r.id in ids for r in m.roles)], roles
 
+    async def _server_muted_away(self, guild):
+        """members whose Discord SERVER mute/deafen flag is on but who are NOT in voice right now.
+        Discord keeps that flag after they leave voice, but discord.py only shows it for people inside voice,
+        so read it straight from the members list of the API."""
+        out, after = [], None
+        try:
+            for _ in range(30):  # up to 30 000 members
+                data = await self.bot.http.get_members(guild.id, 1000, after)
+                if not data:
+                    break
+                for d in data:
+                    if not (d.get("mute") or d.get("deaf")):
+                        continue
+                    uid = int(d["user"]["id"])
+                    mem = guild.get_member(uid)
+                    if mem is not None and mem.voice is not None and mem.voice.channel is not None:
+                        continue  # in voice: already listed by the voice check
+                    u = d["user"]
+                    out.append({
+                        "id": str(uid),
+                        "name": d.get("nick") or u.get("global_name") or u.get("username") or str(uid),
+                        "muted": bool(d.get("mute")),
+                        "deafened": bool(d.get("deaf")),
+                    })
+                if len(data) < 1000:
+                    break
+                after = int(data[-1]["user"]["id"])
+        except Exception as e:
+            log.warning("could not read server-muted members from the API: %s", e)
+        return out
+
     async def t_list_muted(self, ctx, scope="voice"):
         if scope not in ("voice", "timeout", "all"):
             scope = "voice"
@@ -1977,11 +2019,14 @@ class AIAdmin(commands.Cog):
         voice, timed = self._muted_sets(g)
         roled, roles = self._role_muted(g)
         show_v, show_t = scope in ("voice", "all"), scope in ("timeout", "all")
+        away = await self._server_muted_away(g) if show_v else []
         return {
             "scope": scope,
             "voice_muted_or_deafened": [
                 {"id": str(m.id), "name": m.display_name, "muted": m.voice.mute, "deafened": m.voice.deaf} for m in voice[:50]
             ] if show_v else [],
+            "muted_outside_voice": away[:50],
+            "outside_voice_count": len(away),
             "muted_by_role": [{"id": str(m.id), "name": m.display_name} for m in roled[:50]] if show_v else [],
             "mute_role_names": [r.name for r in roles],
             "mute_role_count": len(roled),
@@ -1998,14 +2043,23 @@ class AIAdmin(commands.Cog):
             scope = "voice"
         voice, timed = self._muted_sets(guild)
         roled, roles = self._role_muted(guild)
+        away = []
         if scope == "voice":
             timed = []
         elif scope == "timeout":
             voice, roled = [], []
+        if scope in ("voice", "all"):
+            away = await self._server_muted_away(guild)
+        away_note = (
+            f"{len(away)} server-muted member(s) are not in voice - Discord only lets me unmute them while they are in a voice "
+            "channel, so I can't change those until they join one."
+        ) if away else ""
         if not voice and not timed and not roled:
             msg = {"voice": "Nobody is muted right now.", "timeout": "Nobody is timed out right now."}.get(
                 scope, "Nobody is muted or timed out right now."
             )
+            if away:
+                msg = away_note
             return {"ok": True, "message": msg, "summary": msg}
         title = {"voice": "UNMUTE ALL", "timeout": "REMOVE ALL TIMEOUTS"}.get(scope, "UNMUTE ALL + REMOVE ALL TIMEOUTS")
         lines = []
@@ -2013,6 +2067,8 @@ class AIAdmin(commands.Cog):
             lines.append(f"Voice mute/deafen to remove: **{len(voice)}**")
             if roles:
                 lines.append(f"Mute role ({', '.join(r.name for r in roles)}) to remove: **{len(roled)}**")
+            if away:
+                lines.append(f"Muted but not in voice (can't change now): **{len(away)}**")
         if scope in ("timeout", "all"):
             lines.append(f"Timeouts to remove: **{len(timed)}**")
         if not await self._confirm(ctx, title + "\n" + "\n".join(lines)):
@@ -2039,6 +2095,8 @@ class AIAdmin(commands.Cog):
             summary = f"Done: voice unmuted **{done_v}**, mute role removed **{done_r}**, timeouts removed **{done_t}**."
         if failed:
             summary += f" Failed for {len(failed)}: {', '.join(failed[:10])} (check the bot's role position)."
+        if away_note:
+            summary += "\n" + away_note
         return {"ok": True, "voice_unmuted": done_v, "mute_role_removed": done_r, "timeouts_removed": done_t,
                 "failed": failed[:20], "summary": summary}
 
