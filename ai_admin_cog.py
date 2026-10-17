@@ -274,7 +274,7 @@ TOOLS = [
     },
     {
         "name": "purge_messages",
-        "description": "Delete the last N messages (max 200) in a channel, optionally only from one member. Needs button confirm.",
+        "description": "Delete the last N messages (max 2000; use 2000 for 'delete everything') in a text channel or voice-channel chat, optionally only from one member. Needs button confirm.",
         "input_schema": {
             "type": "object",
             "properties": {"channel": {"type": "string"}, "amount": {"type": "integer"}, "member": {"type": "string"}},
@@ -557,6 +557,7 @@ class AIAdmin(commands.Cog):
             "voice channel - just call the tool. To ping someone use send_message's tag argument. "
             "Do what the staff member asks. Jokes and banter are fine, send them as written; only refuse real harassment "
             "or hate. Never answer 'I can't help with that' without trying a tool first. "
+            "If a tool returns an error, tell the staff member the exact error text so they can fix it. "
             "Never ask for confirmation in text - the buttons handle that. Names don't need to be exact (emojis and fancy "
             "letters are ignored): try the closest match, use list_members/list_channels if unsure, and chain tools. "
             "If a member name matches several people, ask which one. "
@@ -650,14 +651,31 @@ class AIAdmin(commands.Cog):
                 hits.append(mem)
         return hits[0] if len(hits) == 1 else None
 
+    def _member_in_vc(self, ch, q):
+        """a member currently connected to this voice channel whose name matches q"""
+        if not isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
+            return None
+        qn = _norm(q)
+        if not qn:
+            return None
+        for m in ch.members:
+            if qn in _norm(m.display_name) or qn in _norm(m.name):
+                return m
+        return None
+
+    async def _who(self, guild, ch, q):
+        """member by name: first people in that voice channel, then the whole server"""
+        m = self._member_in_vc(ch, q)
+        if m:
+            return m, None
+        return await self._one_member(guild, q)
+
     async def _quick_say(self, ctx, text):
-        """'say X in <channel> and tag <member>' - done directly, no AI (instant, never refused)."""
+        """'say X in <channel> and tag <member>' / 'text A to say to B <msg> in <vc>' - no AI needed (instant)."""
         m = re.match(r"^\s*(say|send|write|tell|text|type|post)\s+(.+?)\s*$", text, re.I | re.S)
         if not m:
             return None
         verb, rest = m.group(1).lower(), m.group(2)
-        # filler like "syrox to say to bcba ..." / "to say ..."
-        rest = re.sub(r"^(?:\S+\s+)?to\s+(?:say|write|type|post)\s+(?:to\s+)?", "", rest, count=1, flags=re.I)
         g = ctx["guild"]
         last = self.last_say.get(ctx["channel"].id) or {}
         tag_text = None
@@ -679,6 +697,24 @@ class AIAdmin(commands.Cog):
             ch, follow_up = g.get_channel(last["channel"]), True
         if ch is None or not hasattr(ch, "send") or not body.strip():
             return None
+
+        allow = discord.AllowedMentions(everyone=False, roles=False, users=True)
+        # relay: "syrox to say to bcba he is stupid" -> "@syrox say to @bcba: he is stupid"
+        r = re.match(r"^(\S+)\s+to\s+(?:say|tell|write|type|post)\s+(?:to\s+)?(\S+)\s+(.+)$", body, re.I | re.S)
+        if r:
+            a, err_a = await self._who(g, ch, r.group(1))
+            b, err_b = await self._who(g, ch, r.group(2))
+            if a and b:
+                msg = f"<@{a.id}> say to <@{b.id}>: {r.group(3).strip()}"
+                try:
+                    await ch.send(msg, allowed_mentions=allow)
+                except discord.Forbidden:
+                    return f"I don't have permission to write in {ch.name} (give the bot View Channel + Send Messages there)."
+                self.last_say[ctx["channel"].id] = {"channel": ch.id, "tag": a.id}
+                await self._log_action(ctx, f"message in {ch.mention}: {msg[:300]}")
+                return f"Sent in **{ch.name}**: tagged **{a.display_name}** and **{b.display_name}**."
+            body = re.sub(r"^(?:\S+\s+)?to\s+(?:say|write|type|post)\s+(?:to\s+)?", "", body, count=1, flags=re.I)
+
         tag = None
         unsure = False
         if tag_text and tag_text.lower() in PRONOUNS:
@@ -689,10 +725,10 @@ class AIAdmin(commands.Cog):
                 tag = str(guess.id) if guess else None
                 unsure = guess is None
         elif tag_text:
-            mem, err = await self._one_member(g, tag_text)
+            mem, err = await self._who(g, ch, tag_text)
             if err:
                 return f"Couldn't tag '{tag_text}': {err.get('error', 'unknown member')}" + (
-                    " - " + ", ".join(c["name"] for c in err.get("candidates", [])) if err.get("candidates") else ""
+                    " - " + ", ".join(x["name"] for x in err.get("candidates", [])) if err.get("candidates") else ""
                 )
             tag = str(mem.id)
         elif follow_up and last.get("tag"):
@@ -1319,21 +1355,26 @@ class AIAdmin(commands.Cog):
             return bad
         g = ctx["guild"]
         ch = self._find_channel(g, channel)
-        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-            return {"error": f"Text channel '{channel}' not found."}
+        if ch is None or not hasattr(ch, "purge"):
+            return {"error": f"Channel '{channel}' not found (or it can't hold messages)."}
+        if not ch.permissions_for(g.me).manage_messages:
+            return {"error": f"I need the 'Manage Messages' permission in #{ch.name} to delete messages."}
         uid = None
         if member:
             m, err = await self._one_member(g, member)
             if err:
                 return err
             uid = m.id
-        amount = max(1, min(int(amount), 200))
+        amount = max(1, min(int(amount), 2000))  # for "delete everything" use 2000
         who = f" from **{member}**" if member else ""
         if not await self._confirm(ctx, f"DELETE the last **{amount}** messages{who} in {ch.mention}"):
             return {"cancelled": True}
-        deleted = await ch.purge(
-            limit=amount, check=(lambda x: x.author.id == uid) if uid else None, reason=f"AI, by {ctx['author']}"
-        )
+        try:
+            deleted = await ch.purge(
+                limit=amount, check=(lambda x: x.author.id == uid) if uid else None, reason=f"AI, by {ctx['author']}"
+            )
+        except discord.HTTPException as e:
+            return {"error": f"Discord refused the delete: {e}"}
         await self._log_action(ctx, f"purged {len(deleted)} messages{who} in {ch.mention}")
         return {"ok": True, "deleted": len(deleted)}
 
