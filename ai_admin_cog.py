@@ -212,7 +212,7 @@ TOOL_GROUPS = [
     (re.compile(r"\bdm\b|direct|private|خاص"), {"dm_member"}),
     (re.compile(r"nick|rename|surnom|لقب"), {"set_nickname"}),
     (re.compile(r"join|new member|recent|انضم"), {"recent_joins"}),
-    (re.compile(r"voice|\bvc\b|move|disconnect|صوت|فويس"), {"voice_action", "list_voice", "list_muted"}),
+    (re.compile(r"voice|\bvc\b|move|disconnect|صوت|فويس"), {"voice_action", "voice_tour", "list_voice", "list_muted"}),
     (re.compile(r"who is|who's|whos|who are|goat|best|top|active|most|leaderboard|stat"),
      {"top_active", "list_roles", "list_voice"}),
     (re.compile(r"bump|disboard|remind|every ?time|automat|alert"),
@@ -329,6 +329,13 @@ TOOLS = [
     _tool("voice_action", "Voice control on a member who is in voice: move (needs channel), disconnect, mute, unmute, deafen, undeafen.",
           {"member": _s(_MEM), "action": _s(enum=["move", "disconnect", "mute", "unmute", "deafen", "undeafen"]),
            "channel": _s()}, ["member", "action"]),
+    _tool("voice_tour",
+          "Move a member who is in voice through EVERY voice channel one after another (about 1 second each), skipping the "
+          "channels in `exclude`, then bring them back to where they were (button confirm). Use it for 'move X to every / all "
+          "voice channels (except Y)'. Discord can't put someone in several channels at once, so this does it one by one.",
+          {"member": _s(_MEM),
+           "exclude": {"type": "array", "items": {"type": "string"}, "description": "voice channel names or ids to skip"},
+           "return_back": _b("go back to the starting channel at the end (default true)")}, ["member"]),
     _tool("unban_user", "Unban a user by name or id (button confirm).", {"user": _s(), "reason": _s()}, ["user"]),
     _tool("bulk_role", "Add/remove a role for MANY members: everyone, or only members who have from_role (button confirm).",
           {"role": _s(), "action": _s(enum=["add", "remove"]), "from_role": _s()}, ["role", "action"]),
@@ -361,7 +368,7 @@ READ_TOOLS = {
 }
 CONFIRM_TOOLS = {
     "kick_member", "ban_member", "timeout_member", "change_role", "unmute_all", "purge_messages",
-    "wipe_channel", "delete_channel", "delete_role", "lock_channel", "unban_user", "bulk_role",
+    "wipe_channel", "delete_channel", "delete_role", "lock_channel", "unban_user", "bulk_role", "voice_tour",
 }
 INT_ARGS = ("days", "limit", "minutes", "hours", "max_results", "amount", "slowmode_seconds", "remind_minutes")
 BOOL_ARGS = ("locked", "enabled", "ping_now")
@@ -759,6 +766,8 @@ class AIAdmin(commands.Cog):
             "ACTIONS: call the matching tool and do what the staff member asks. Destructive tools show a confirmation button "
             "by themselves - never ask for confirmation in text. 'Delete N messages' -> purge_messages ONCE. "
             "'Delete all/every message, clear, nuke a channel' -> wipe_channel ONCE. "
+            "'Move X to every / all voice channels (except Y)' -> voice_tour ONCE (it moves them one by one and brings them "
+            "back) - never say it is impossible. "
             "Only say something was done AFTER its tool returned ok. If a tool returns an error, show the staff member the "
             "exact error text. "
             "Voice channels have their own text chat: send_message works for them too - never say you can't write in a voice "
@@ -2141,6 +2150,74 @@ class AIAdmin(commands.Cog):
             )
         await self._log_action(ctx, f"voice {action} on **{m}**")
         return {"ok": True, "summary": f"Voice {action} done on **{m.display_name}**."}
+
+    def _chan_ids_from(self, guild, items):
+        """channel names / ids (list or one string) -> (set of channel ids, things that matched no channel)"""
+        if items is None:
+            return set(), []
+        if not isinstance(items, (list, tuple, set)):
+            items = re.split(r"\s*(?:,|;|\band\b)\s*", str(items))
+        ids, bad = set(), []
+        for part in items:
+            part = str(part).strip()
+            if not part:
+                continue
+            for q in re.findall(r"\d{15,20}", part) or [part]:
+                c = self._find_channel(guild, q)
+                if c is None:
+                    bad.append(q)
+                else:
+                    ids.add(c.id)
+        return ids, bad
+
+    async def t_voice_tour(self, ctx, member, exclude=None, return_back=True):
+        g = ctx["guild"]
+        m, err = await self._one_member(g, member)
+        if err:
+            return err
+        if not isinstance(m, discord.Member) or not m.voice or not m.voice.channel:
+            return {"error": "That member is not in a voice channel."}
+        bad = self._check_hierarchy(g, ctx["author"], m)
+        if bad:
+            return {"error": bad}
+        skip, missing = self._chan_ids_from(g, exclude)
+        if missing:
+            return {"error": "Channel not found: " + ", ".join(missing) + " - check the name or id."}
+        origin = m.voice.channel
+        chans = [
+            c for c in g.voice_channels
+            if c.id not in skip and c.id != origin.id and c.permissions_for(g.me).move_members
+            and c.permissions_for(g.me).connect
+        ][:25]
+        if not chans:
+            return {"error": "No voice channel left to move them to (check the exclusions and my Move Members permission)."}
+        ex = f"\nSkipping: {', '.join(c.name for c in (g.get_channel(i) for i in skip) if c)}" if skip else ""
+        if not await self._confirm(
+            ctx, f"Move **{m}** through **{len(chans)}** voice channels, one by one (~1 s each){ex}"
+            + ("\nThey go back to where they were at the end." if return_back else "")
+        ):
+            return {"cancelled": True}
+        reason = f"AI voice tour, by {ctx['author']}"
+        done, left = 0, False
+        for c in chans:
+            if not m.voice or not m.voice.channel:  # they left voice - stop
+                left = True
+                break
+            try:
+                await m.move_to(c, reason=reason)
+                done += 1
+            except discord.HTTPException:
+                continue
+            await asyncio.sleep(1.2)
+        if return_back and m.voice and m.voice.channel:
+            try:
+                await m.move_to(origin, reason=reason)
+            except discord.HTTPException:
+                pass
+        await self._log_action(ctx, f"voice tour on **{m}**: {done} channels")
+        summary = f"Moved **{m.display_name}** through **{done}** voice channels"
+        summary += " (they left voice, so I stopped)." if left else (" and back to where they were." if return_back else ".")
+        return {"ok": True, "moved": done, "summary": summary}
 
     async def t_unban_user(self, ctx, user, reason="No reason given"):
         g = ctx["guild"]
