@@ -155,7 +155,7 @@ TOOLS = [
     },
     {
         "name": "send_message",
-        "description": "Send a message as the bot in a channel (no @everyone/@here/role pings).",
+        "description": "Send a message as the bot in a text channel OR in the chat of a voice channel (give its name or id). To tag a member write <@their_id> (get the id with list_members/member_info). No @everyone/@here/role pings.",
         "input_schema": {
             "type": "object",
             "properties": {"channel": {"type": "string"}, "text": {"type": "string"}},
@@ -899,13 +899,9 @@ class AIAdmin(commands.Cog):
         return {"ok": True, "sent_to": str(user)}
 
     async def t_send_message(self, ctx, channel, text):
-        guild = ctx["guild"]
-        cid = re.search(r"\d{15,20}", channel)
-        ch = guild.get_channel(int(cid.group())) if cid else discord.utils.find(
-            lambda c: c.name.lower() == channel.lower().lstrip("#"), guild.text_channels
-        )
-        if not isinstance(ch, discord.TextChannel):
-            return {"error": f"Text channel '{channel}' not found."}
+        ch = self._find_channel(ctx["guild"], channel)
+        if not hasattr(ch, "send"):
+            return {"error": f"Channel '{channel}' not found or can't receive messages."}
         await ch.send(text, allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True))
         await self._log_action(ctx, f"message in {ch.mention}: {text[:300]}")
         return {"ok": True, "channel": ch.name}
