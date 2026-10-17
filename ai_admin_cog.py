@@ -70,6 +70,10 @@ A = discord.AuditLogAction
 REFUSAL_RE = re.compile(
     r"^\s*(i['’]?m sorry|i am sorry|sorry|i can['’]?t|i cannot|i couldn['’]?t|something broke|i didn['’]?t understand)", re.I
 )
+CONFIRM_TOOLS = {
+    "kick_member", "ban_member", "timeout_member", "change_role", "unmute_all", "purge_messages",
+    "wipe_channel", "delete_channel", "delete_role", "lock_channel", "unban_user", "bulk_role",
+}
 PRONOUNS = {"him", "her", "them", "he", "she", "it", "me"}
 STOPWORDS = {
     "the", "and", "you", "are", "for", "this", "that", "with", "hey", "hello", "yes", "not", "but", "can", "his",
@@ -282,6 +286,14 @@ TOOLS = [
         },
     },
     {
+        "name": "wipe_channel",
+        "description": (
+            "Delete EVERY message of a channel (even very old ones) by re-creating it with the same name, permissions "
+            "and position (new channel id). Use for 'delete all messages / clear / nuke the channel'. Needs button confirm."
+        ),
+        "input_schema": {"type": "object", "properties": {"channel": {"type": "string"}}, "required": ["channel"]},
+    },
+    {
         "name": "create_channel",
         "description": "Create a text channel, voice channel or category.",
         "input_schema": {
@@ -430,6 +442,14 @@ def _embed_text(e: discord.Embed) -> str:
     return " ".join(p for p in parts if p)
 
 
+class _NoLock:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
 class Confirm(discord.ui.View):
     def __init__(self, author_id: int):
         super().__init__(timeout=60)
@@ -460,16 +480,14 @@ class AIAdmin(commands.Cog):
         self.bot = bot
         self.ai = AsyncOpenAI(api_key=AI_API_KEY or 'missing', base_url=AI_BASE_URL)
         self.history = defaultdict(lambda: deque(maxlen=8))  # per channel, text only
-        self.locks = defaultdict(asyncio.Lock)
+        self.locks = defaultdict(_NoLock)
         self.last_say = {}  # per channel: last channel/person the bot posted to
 
     # ------------------------------------------------------------ access
     def _authorized(self, m: discord.Member) -> bool:
-        return (
-            m.guild_permissions.administrator
-            or m.id in ALLOWED_USER_IDS
-            or any(r.id in ALLOWED_ROLE_IDS for r in m.roles)
-        )
+        """only the server owner, or members whose highest role is ABOVE the bot's highest role"""
+        g = m.guild
+        return m.id == g.owner_id or m.top_role > g.me.top_role
 
     # ------------------------------------------------------- entry points
     @commands.command(name="ask", aliases=["ai"])
@@ -532,7 +550,10 @@ class AIAdmin(commands.Cog):
             try:
                 await message.reply(chunk, mention_author=False, allowed_mentions=none)
             except discord.HTTPException:  # original message deleted etc.
-                await message.channel.send(chunk, allowed_mentions=none)
+                try:
+                    await message.channel.send(chunk, allowed_mentions=none)
+                except discord.HTTPException:
+                    pass  # the channel itself is gone (wipe)
 
     # -------------------------------------------------------------- agent
     def _system(self, message: discord.Message) -> str:
@@ -558,6 +579,8 @@ class AIAdmin(commands.Cog):
             "Do what the staff member asks. Jokes and banter are fine, send them as written; only refuse real harassment "
             "or hate. Never answer 'I can't help with that' without trying a tool first. "
             "If a tool returns an error, tell the staff member the exact error text so they can fix it. "
+            "Only say something was done AFTER its tool returned ok - never claim success before. "
+            "'Delete N messages' -> purge_messages ONCE. 'Delete all/every message, clear, nuke a channel' -> wipe_channel ONCE. "
             "Never ask for confirmation in text - the buttons handle that. Names don't need to be exact (emojis and fancy "
             "letters are ignored): try the closest match, use list_members/list_channels if unsure, and chain tools. "
             "If a member name matches several people, ask which one. "
@@ -567,7 +590,7 @@ class AIAdmin(commands.Cog):
 
     async def _agent(self, message, text: str) -> str:
         ctx = {"guild": message.guild, "author": message.author, "channel": message.channel}
-        quick = await self._quick_say(ctx, text)  # instant, no AI needed
+        quick = await self._quick_say(ctx, text) or await self._quick_delete(ctx, text)  # instant, no AI needed
         if quick:
             return quick
         if not AI_API_KEY:
@@ -576,6 +599,7 @@ class AIAdmin(commands.Cog):
         msgs = [{"role": "system", "content": self._system(message)}] + list(hist) + [{"role": "user", "content": text}]
         final = "I couldn't finish that, try rephrasing."
         used_tools = nudged = False
+        done_calls = set()
         try:
             for _ in range(8):
                 resp = await self._complete(msgs)
@@ -609,12 +633,24 @@ class AIAdmin(commands.Cog):
                         ],
                     }
                 )
+                confirmed_once = was_cancelled = False
                 for tc in msg.tool_calls:
                     try:
                         args = json.loads(tc.function.arguments or "{}")
                     except ValueError:
                         args = {}
-                    out = await self._dispatch(tc.function.name, args, ctx)
+                    key = (tc.function.name, json.dumps(args, sort_keys=True, default=str))
+                    if key in done_calls:
+                        out = {"skipped": "already did exactly this in this request - do not repeat it"}
+                    elif tc.function.name in CONFIRM_TOOLS and confirmed_once:
+                        out = {"skipped": "only one confirmation at a time - the staff member can ask for the next one after"}
+                    else:
+                        out = await self._dispatch(tc.function.name, args, ctx)
+                        done_calls.add(key)
+                        if tc.function.name in CONFIRM_TOOLS:
+                            confirmed_once = True
+                        if isinstance(out, dict) and out.get("cancelled"):
+                            was_cancelled = True
                     msgs.append(
                         {
                             "role": "tool",
@@ -622,6 +658,9 @@ class AIAdmin(commands.Cog):
                             "content": json.dumps(out, ensure_ascii=False, default=str)[:5000],
                         }
                     )
+                if was_cancelled:
+                    final = "Cancelled."
+                    break
         except openai.RateLimitError:
             return "Free limit reached for now - wait about a minute and try again."
         except openai.NotFoundError:
@@ -669,6 +708,40 @@ class AIAdmin(commands.Cog):
         if m:
             return m, None
         return await self._one_member(guild, q)
+
+    async def _quick_delete(self, ctx, text):
+        """'delete all messages in X' -> wipe_channel, 'delete 50 messages in X' -> purge (instant, no AI)"""
+        g = ctx["guild"]
+        verb = r"(?:delet\w*|remov\w*|clear|clean|wipe|nuke|purge)"
+        where = r"(?:\s+(?:in|from|of|on)\s+(?:the\s+)?(?:channel\s+)?(?P<ch>.+?)|\s+(?P<here>here|this\s+channel))?"
+        nouns = r"(?:msgs?|messages?|chat)"
+        m_all = re.match(rf"^\s*{verb}\s+(?:every|all|everything)(?:\s+(?:the\s+)?{nouns})?{where}\s*$", text, re.I)
+        m_n = re.match(rf"^\s*{verb}\s+(?:the\s+)?(?:last\s+)?(?P<n>\d{{1,4}})\s*{nouns}{where}\s*$", text, re.I)
+        m = m_all or m_n
+        if not m:
+            return None
+        q = (m.group("ch") or "").strip()
+        q = re.sub(r"^(?:here|this(?:\s+channel)?)$", "", q, flags=re.I).strip()
+        if q:
+            ch = self._find_channel(g, q)
+            if ch is None:
+                return f"I can't find a channel called '{q}'."
+        else:
+            ch = ctx["channel"]
+        try:
+            if m_all:
+                res = await self.t_wipe_channel(ctx, str(ch.id))
+            else:
+                res = await self.t_purge_messages(ctx, str(ch.id), int(m_n.group("n")))
+        except discord.Forbidden:
+            return "Discord says I don't have permission for that (check the bot role and permissions)."
+        if res.get("cancelled"):
+            return "Cancelled."
+        if res.get("error"):
+            return res["error"]
+        if m_all:
+            return f"Done - **{res['name']}** is wiped (new channel id `{res['new_channel_id']}`)."
+        return f"Deleted **{res['deleted']}** messages." + (f" {res['note']}" if res.get("note") else "")
 
     async def _quick_say(self, ctx, text):
         """'say X in <channel> and tag <member>' / 'text A to say to B <msg> in <vc>' - no AI needed (instant)."""
@@ -1187,11 +1260,7 @@ class AIAdmin(commands.Cog):
 
     # ------------------------------------------- server-wide read / manage
     def _need(self, ctx, perm):
-        a = ctx["author"]
-        gp = a.guild_permissions
-        if gp.administrator or getattr(gp, perm, False):
-            return None
-        return {"error": f"You don't have the '{perm}' permission."}
+        return None  # access is already limited to people above the bot's role
 
     def _find_channel(self, guild, q):
         q = str(q).strip()
@@ -1369,14 +1438,48 @@ class AIAdmin(commands.Cog):
         who = f" from **{member}**" if member else ""
         if not await self._confirm(ctx, f"DELETE the last **{amount}** messages{who} in {ch.mention}"):
             return {"cancelled": True}
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=13, hours=23)
         try:
             deleted = await ch.purge(
-                limit=amount, check=(lambda x: x.author.id == uid) if uid else None, reason=f"AI, by {ctx['author']}"
+                limit=amount,
+                after=cutoff,  # Discord can only bulk-delete messages younger than 14 days (older = very slow)
+                check=(lambda x: x.author.id == uid) if uid else None,
+                reason=f"AI, by {ctx['author']}",
             )
         except discord.HTTPException as e:
             return {"error": f"Discord refused the delete: {e}"}
         await self._log_action(ctx, f"purged {len(deleted)} messages{who} in {ch.mention}")
-        return {"ok": True, "deleted": len(deleted)}
+        out = {"ok": True, "deleted": len(deleted)}
+        if len(deleted) < amount:
+            out["note"] = "Messages older than 14 days can't be bulk-deleted. To remove EVERYTHING use wipe_channel."
+        return out
+
+    async def t_wipe_channel(self, ctx, channel):
+        g = ctx["guild"]
+        ch = self._find_channel(g, channel)
+        if not isinstance(ch, (discord.TextChannel, discord.VoiceChannel)):
+            return {"error": f"Text/voice channel '{channel}' not found."}
+        if not await self._confirm(
+            ctx,
+            f"WIPE **{ch.name}**: delete ALL its messages by re-creating the channel.\n"
+            "Same name, permissions and position - but it gets a NEW channel id (other bots that use the old id need updating).",
+        ):
+            return {"cancelled": True}
+        reason = f"AI wipe, by {ctx['author']}"
+        pos = ch.position
+        new = await ch.clone(reason=reason)
+        await ch.delete(reason=reason)
+        try:
+            await new.edit(position=pos, reason=reason)
+        except discord.HTTPException:
+            pass
+        if ch.id == ctx["channel"].id:
+            try:
+                await new.send("Channel wiped.")
+            except discord.HTTPException:
+                pass
+        await self._log_action(ctx, f"wiped channel **{new.name}**")
+        return {"ok": True, "new_channel_id": str(new.id), "name": new.name}
 
     async def t_create_channel(self, ctx, name, kind="text", category=None):
         bad = self._need(ctx, "manage_channels")
