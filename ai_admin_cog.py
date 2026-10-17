@@ -34,6 +34,8 @@ SETUP
     AI_REASONING            (optional) low (fastest, default) / medium / high (smarter, slower)
     VERIFIED_ROLE_IDS       comma separated role id(s) that mean "verified"
     VERIFY_CHECK_CHANNEL_ID (optional) the verify-check channel id (otherwise found by name)
+    MUTE_ROLE_IDS           (optional) role id(s) of your "Muted" role(s) - "who is muted" also lists people holding it, even
+                            outside voice (empty = any role with "mute" in its name counts)
     AI_CHANNEL_IDS          (optional) channels where no !ask / mention is needed (staff only; members must @mention)
     AI_ACTION_LOG_ID        (optional) channel id where every AI action is logged
     DM_FOOTER               (optional) text added under every DM the bot sends
@@ -89,6 +91,7 @@ def _ids(name):
 
 
 VERIFIED_ROLE_IDS = _ids("VERIFIED_ROLE_IDS")
+MUTE_ROLE_IDS = _ids("MUTE_ROLE_IDS")  # your "Muted" role(s); empty = any role with "mute" in its name counts
 AI_CHANNEL_IDS = _ids("AI_CHANNEL_IDS")
 ACTION_LOG_ID = int(os.getenv("AI_ACTION_LOG_ID", "0") or 0)
 DM_FOOTER = os.getenv("DM_FOOTER", "")
@@ -347,7 +350,7 @@ TOOLS = [
           {"role": _s(), "action": _s(enum=["add", "remove"]), "from_role": _s()}, ["role", "action"]),
     _tool("list_muted",
           "Who is muted RIGHT NOW. scope=voice (DEFAULT, what 'who is muted / mute' means): members server-muted or deafened "
-          "in voice. scope=timeout: members who are timed out. scope=all: both - only when they ask for both.",
+          "in voice PLUS members holding the server's 'Muted' role (they can be outside voice). scope=timeout: members who are timed out. scope=all: both - only when they ask for both.",
           {"scope": _s(enum=["voice", "timeout", "all"])}),
     _tool("unmute_all",
           "Voice mute and timeout are SEPARATE. scope=voice (DEFAULT, 'unmute all'): remove server mute/deafen in voice ONLY. "
@@ -443,14 +446,13 @@ def _is_here(q):
 
 
 def _fmt_muted(r, scope="voice"):
-    v, t = r["voice_muted_or_deafened"], r["timed_out"]
-    hint = ""  # mute and timeout are separate: a mute answer never mentions timeouts (and the other way round)
-    if not v and not t:
+    v, t, rl = r["voice_muted_or_deafened"], r["timed_out"], r.get("muted_by_role", [])
+    if not v and not t and not rl:  # mute and timeout are separate: a mute answer never mentions timeouts (and vice versa)
         if scope == "timeout":
             return "Nobody is timed out right now."
         if scope == "all":
             return "Nobody is muted or timed out right now."
-        return "Nobody is muted in voice right now." + hint
+        return "Nobody is muted right now."
     lines = []
     if v:
         parts = []
@@ -458,7 +460,14 @@ def _fmt_muted(r, scope="voice"):
             flags = [f for f, on in (("muted", x["muted"]), ("deafened", x["deafened"])) if on]
             parts.append(f"{x['name']} ({'/'.join(flags)})")
         more = r["voice_count"] - len(v)
-        lines.append(f"**Voice muted/deafened ({r['voice_count']}):** " + ", ".join(parts) + (f" +{more} more" if more > 0 else ""))
+        lines.append(f"**Muted in voice ({r['voice_count']}):** " + ", ".join(parts) + (f" +{more} more" if more > 0 else ""))
+    if rl:
+        more = r["mute_role_count"] - len(rl)
+        label = ", ".join(r.get("mute_role_names") or ["mute role"])
+        lines.append(
+            f"**Muted by role - {label} ({r['mute_role_count']}):** " + ", ".join(x["name"] for x in rl)
+            + (f" +{more} more" if more > 0 else "")
+        )
     if t:
         more = r["timeout_count"] - len(t)
         lines.append(
@@ -466,7 +475,7 @@ def _fmt_muted(r, scope="voice"):
             + ", ".join(f"{x['name']} (ends <t:{x['until_unix']}:R>)" for x in t)
             + (f" +{more} more" if more > 0 else "")
         )
-    return "\n".join(lines) + hint
+    return "\n".join(lines)
 
 
 class Confirm(discord.ui.View):
@@ -1946,16 +1955,36 @@ class AIAdmin(commands.Cog):
         timed = [m for m in guild.members if m.is_timed_out()]
         return voice, timed
 
+    def _mute_roles(self, guild):
+        """the server's 'Muted' role(s): MUTE_ROLE_IDS, or any role with 'mute' in its name"""
+        if MUTE_ROLE_IDS:
+            return [r for r in (guild.get_role(i) for i in MUTE_ROLE_IDS) if r is not None]
+        return [
+            r for r in guild.roles
+            if not r.is_default() and not r.managed and "mute" in _norm(r.name) and "unmute" not in _norm(r.name)
+        ]
+
+    def _role_muted(self, guild):
+        """members who hold a mute role (they can be anywhere, not only in voice)"""
+        roles = self._mute_roles(guild)
+        ids = {r.id for r in roles}
+        return [m for m in guild.members if any(r.id in ids for r in m.roles)], roles
+
     async def t_list_muted(self, ctx, scope="voice"):
         if scope not in ("voice", "timeout", "all"):
             scope = "voice"
-        voice, timed = self._muted_sets(ctx["guild"])
+        g = ctx["guild"]
+        voice, timed = self._muted_sets(g)
+        roled, roles = self._role_muted(g)
         show_v, show_t = scope in ("voice", "all"), scope in ("timeout", "all")
         return {
             "scope": scope,
             "voice_muted_or_deafened": [
                 {"id": str(m.id), "name": m.display_name, "muted": m.voice.mute, "deafened": m.voice.deaf} for m in voice[:50]
             ] if show_v else [],
+            "muted_by_role": [{"id": str(m.id), "name": m.display_name} for m in roled[:50]] if show_v else [],
+            "mute_role_names": [r.name for r in roles],
+            "mute_role_count": len(roled),
             "timed_out": [
                 {"id": str(m.id), "name": m.display_name, "until_unix": int(m.timed_out_until.timestamp())} for m in timed[:50]
             ] if show_t else [],
@@ -1968,37 +1997,50 @@ class AIAdmin(commands.Cog):
         if scope not in ("voice", "timeout", "all"):
             scope = "voice"
         voice, timed = self._muted_sets(guild)
+        roled, roles = self._role_muted(guild)
         if scope == "voice":
             timed = []
         elif scope == "timeout":
-            voice = []
-        if not voice and not timed:
-            msg = {"voice": "Nobody is muted in voice right now.", "timeout": "Nobody is timed out right now."}.get(
+            voice, roled = [], []
+        if not voice and not timed and not roled:
+            msg = {"voice": "Nobody is muted right now.", "timeout": "Nobody is timed out right now."}.get(
                 scope, "Nobody is muted or timed out right now."
             )
             return {"ok": True, "message": msg, "summary": msg}
-        title = {"voice": "UNMUTE ALL (voice)", "timeout": "REMOVE ALL TIMEOUTS"}.get(scope, "UNMUTE ALL + REMOVE ALL TIMEOUTS")
+        title = {"voice": "UNMUTE ALL", "timeout": "REMOVE ALL TIMEOUTS"}.get(scope, "UNMUTE ALL + REMOVE ALL TIMEOUTS")
         lines = []
         if scope in ("voice", "all"):
             lines.append(f"Voice mute/deafen to remove: **{len(voice)}**")
+            if roles:
+                lines.append(f"Mute role ({', '.join(r.name for r in roles)}) to remove: **{len(roled)}**")
         if scope in ("timeout", "all"):
             lines.append(f"Timeouts to remove: **{len(timed)}**")
         if not await self._confirm(ctx, title + "\n" + "\n".join(lines)):
             return {"cancelled": True}
         reason = f"AI unmute all, by {ctx['author']}"
+
+        async def drop_role(m):
+            rm = [r for r in roles if r in m.roles]
+            if rm:
+                await m.remove_roles(*rm, reason=reason)
+
         done_v, fail_v = await self._each(voice, lambda m: m.edit(mute=False, deafen=False, reason=reason))
+        done_r, fail_r = await self._each(roled, drop_role)
         done_t, fail_t = await self._each(timed, lambda m: m.timeout(None, reason=reason))
-        failed = fail_v + fail_t
-        await self._log_action(ctx, f"{title.lower()} - voice: {done_v}, timeouts removed: {done_t}, failed: {len(failed)}")
+        failed = fail_v + fail_r + fail_t
+        await self._log_action(
+            ctx, f"{title.lower()} - voice: {done_v}, mute role removed: {done_r}, timeouts removed: {done_t}, failed: {len(failed)}"
+        )
         if scope == "voice":
-            summary = f"Unmuted **{done_v}** member(s) in voice."
+            summary = f"Unmuted **{done_v}** in voice, removed the mute role from **{done_r}**."
         elif scope == "timeout":
             summary = f"Removed **{done_t}** timeout(s)."
         else:
-            summary = f"Done: voice unmuted **{done_v}**, timeouts removed **{done_t}**."
+            summary = f"Done: voice unmuted **{done_v}**, mute role removed **{done_r}**, timeouts removed **{done_t}**."
         if failed:
             summary += f" Failed for {len(failed)}: {', '.join(failed[:10])} (check the bot's role position)."
-        return {"ok": True, "voice_unmuted": done_v, "timeouts_removed": done_t, "failed": failed[:20], "summary": summary}
+        return {"ok": True, "voice_unmuted": done_v, "mute_role_removed": done_r, "timeouts_removed": done_t,
+                "failed": failed[:20], "summary": summary}
 
     # ------------------------------------------- server-wide manage tools
     async def t_purge_messages(self, ctx, channel, amount, member=None):
