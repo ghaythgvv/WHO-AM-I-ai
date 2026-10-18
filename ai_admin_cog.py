@@ -321,9 +321,11 @@ TOOLS = [
           "Only messages younger than 14 days can be bulk deleted.",
           {"channel": _s("name/id or 'here'"), "amount": _i(), "member": _s(_MEM)}, ["channel", "amount"]),
     _tool("wipe_channel",
-          "Delete EVERY message of a channel (even old ones) by re-creating it: same name, permissions, position, NEW id. "
-          "Use for 'delete all messages / clear / nuke the channel' (button confirm).",
-          {"channel": _s("name/id or 'here'")}, ["channel"]),
+          "Delete EVERY message of a channel (also old ones: messages under 14 days in bulk, older ones one by one - slower). "
+          "The channel itself stays exactly as it is (same id). Use for 'delete all / every message, clear the chat' (button "
+          "confirm). Only set recreate=true if they explicitly ask to re-create / nuke the channel (instant, but the channel "
+          "gets a NEW id).",
+          {"channel": _s("name/id or 'here'"), "recreate": _b("default false = just delete the messages")}, ["channel"]),
     _tool("create_channel", "Create a text channel, voice channel or category.",
           {"name": _s(), "kind": _s(enum=["text", "voice", "category"]), "category": _s()}, ["name"]),
     _tool("delete_channel", "Delete a channel or category (button confirm).", {"channel": _s()}, ["channel"]),
@@ -384,7 +386,7 @@ CONFIRM_TOOLS = {
     "wipe_channel", "delete_channel", "delete_role", "lock_channel", "unban_user", "bulk_role", "voice_tour",
 }
 INT_ARGS = ("days", "limit", "minutes", "hours", "max_results", "amount", "slowmode_seconds", "remind_minutes")
-BOOL_ARGS = ("locked", "enabled", "ping_now")
+BOOL_ARGS = ("locked", "enabled", "ping_now", "recreate")
 
 
 # ----------------------------------------------------------------- helpers
@@ -828,7 +830,8 @@ class AIAdmin(commands.Cog):
             "'goat / best / top / most active members' -> top_active (say it is based on recent message activity). "
             "ACTIONS: call the matching tool and do what the staff member asks. Destructive tools show a confirmation button "
             "by themselves - never ask for confirmation in text. 'Delete N messages' -> purge_messages ONCE. "
-            "'Delete all/every message, clear, nuke a channel' -> wipe_channel ONCE. "
+            "'Delete all/every message, clear the chat' -> wipe_channel ONCE (it only deletes the messages, the channel stays; "
+            "use recreate=true only if they say re-create / nuke). "
             "'Move X to every / all voice channels (except Y)' -> voice_tour ONCE (it moves them one by one and brings them "
             "back) - never say it is impossible. "
             "Only say something was done AFTER its tool returned ok. If a tool returns an error, show the staff member the "
@@ -2173,7 +2176,32 @@ class AIAdmin(commands.Cog):
             note = " Messages older than 14 days can't be bulk-deleted - to remove EVERYTHING say `wipe this channel`."
         return {"ok": True, "deleted": deleted, "summary": f"Deleted **{deleted}** messages{who}.{note}"}
 
-    async def t_wipe_channel(self, ctx, channel):
+    async def t_wipe_channel(self, ctx, channel, recreate=False):
+        """delete every message of a channel. Default: really delete them (the channel stays). recreate=True: clone + delete."""
+        if recreate:
+            return await self._wipe_recreate(ctx, channel)
+        g = ctx["guild"]
+        ch = self._chan(ctx, channel)
+        if ch is None or not hasattr(ch, "history"):
+            return {"error": f"Channel '{channel}' not found (or it can't hold messages)."}
+        if not ch.permissions_for(g.me).manage_messages:
+            return {"error": f"I need the 'Manage Messages' permission in #{ch.name} to delete messages."}
+        if not await self._confirm(
+            ctx,
+            f"DELETE ALL messages in {ch.mention}.\n"
+            "Messages younger than 14 days go in bulk, older ones are deleted one by one (can take a while in a big channel). "
+            "The channel itself stays the same.",
+        ):
+            return {"cancelled": True}
+        reason = f"AI delete all, by {ctx['author']}"
+        try:
+            deleted = len(await ch.purge(limit=None, bulk=True, reason=reason))
+        except discord.HTTPException as e:
+            return {"error": f"Discord stopped the delete: {getattr(e, 'text', None) or e}"}
+        await self._log_action(ctx, f"deleted all messages ({deleted}) in {ch.mention}")
+        return {"ok": True, "deleted": deleted, "summary": f"Deleted **{deleted}** messages in **{ch.name}**."}
+
+    async def _wipe_recreate(self, ctx, channel):
         g = ctx["guild"]
         ch = self._chan(ctx, channel)
         if isinstance(ch, discord.Thread):
