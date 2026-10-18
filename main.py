@@ -13,6 +13,7 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 @bot.event
 async def setup_hook():
     await bot.load_extension("ai_admin_cog")
+    await bot.load_extension("voice_cog")
 
 
 @bot.event
