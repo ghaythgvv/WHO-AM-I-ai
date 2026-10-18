@@ -1,6 +1,10 @@
 """
-owner_guard.py  -  protects the server OWNER: whoever moves / disconnects / server-mutes / server-deafens (or times out)
-the owner gets timed out automatically.                                                        [v1]
+owner_guard.py  -  protects YOU (user id 1089079058765205504): whoever moves / disconnects / server-mutes / server-deafens
+(or times out) you gets a 5 minute timeout automatically.                                       [v2]
+
+  * protected = only your id (change with OWNER_GUARD_PROTECT_IDS). The server owner is protected too only if you set
+    OWNER_GUARD_WITH_OWNER=1.
+  * members who have the role 1434612242451529878 are NEVER punished (change with OWNER_GUARD_EXEMPT_ROLE_IDS).
 
 HOW IT WORKS
   - server mute / deafen / timeout of the owner : read from the audit log the moment it happens (exact: it names the victim)
@@ -24,13 +28,15 @@ SETUP
 
 OPTIONAL RAILWAY VARIABLES
   OWNER_GUARD              1 (default) = on, 0 = off
-  OWNER_GUARD_MINUTES      length of the timeout, default 30 (max 40320 = 28 days)
+  OWNER_GUARD_MINUTES      length of the timeout, default 5 (max 40320 = 28 days)
   OWNER_GUARD_LOG_ID       channel id for the alert cards (empty = the owner gets a DM)
   OWNER_GUARD_EXEMPT_IDS   user id(s) that may touch the owner without punishment, e.g. 111,222
-  OWNER_GUARD_PROTECT_IDS  extra user id(s) protected like the owner
+  OWNER_GUARD_PROTECT_IDS  user id(s) that are protected (default: 1089079058765205504 = you)
+  OWNER_GUARD_EXEMPT_ROLE_IDS  role id(s) whose members are never punished (default: 1434612242451529878)
+  OWNER_GUARD_WITH_OWNER   1 = the server owner is protected too (default 0)
   OWNER_GUARD_DRY_RUN      1 = only report, never time out
 
-COMMAND (owner only):  !guard status | on | off | minutes 60 | dry on | dry off     (changes last until the bot restarts;
+COMMAND (you or the owner):  !guard status | on | off | minutes 60 | dry on | dry off     (changes last until the bot restarts;
                        set the Railway variables to make them permanent)
 """
 
@@ -65,7 +71,9 @@ def _flag(name, default):
 
 
 EXEMPT = _ids("OWNER_GUARD_EXEMPT_IDS")
-PROTECT = _ids("OWNER_GUARD_PROTECT_IDS")
+EXEMPT_ROLES = _ids("OWNER_GUARD_EXEMPT_ROLE_IDS") or {1434612242451529878}  # the "high role": its members are never punished
+PROTECT = _ids("OWNER_GUARD_PROTECT_IDS") or {1089079058765205504}  # you
+WITH_OWNER = _flag("OWNER_GUARD_WITH_OWNER", False)
 LOG_ID = _num("OWNER_GUARD_LOG_ID", 0)
 
 
@@ -74,7 +82,7 @@ class OwnerGuard(commands.Cog):
         self.bot = bot
         self.on = _flag("OWNER_GUARD", True)
         self.dry = _flag("OWNER_GUARD_DRY_RUN", False)
-        self.minutes = max(1, min(_num("OWNER_GUARD_MINUTES", 30), 40320))
+        self.minutes = max(1, min(_num("OWNER_GUARD_MINUTES", 5), 40320))
         self.seen = deque(maxlen=200)  # audit entries already handled
         self._bg = set()
 
@@ -89,7 +97,7 @@ class OwnerGuard(commands.Cog):
 
     def _protected(self, guild):
         ids = set(PROTECT)
-        if guild.owner_id:
+        if WITH_OWNER and guild.owner_id:
             ids.add(guild.owner_id)
         return ids
 
@@ -153,7 +161,7 @@ class OwnerGuard(commands.Cog):
     async def _punish(self, guild, victim, victim_id, culprit_id, what):
         if culprit_id is None or culprit_id == victim_id or culprit_id == self.bot.user.id:
             return  # unknown / himself / this bot (for example the AI admin acting on the owner's order)
-        if culprit_id in EXEMPT or culprit_id == guild.owner_id:
+        if culprit_id in EXEMPT or culprit_id in self._protected(guild):
             return
         culprit = guild.get_member(culprit_id)
         if culprit is None:
@@ -161,6 +169,9 @@ class OwnerGuard(commands.Cog):
                 culprit = await guild.fetch_member(culprit_id)
             except discord.HTTPException:
                 culprit = None
+        if culprit is not None and any(r.id in EXEMPT_ROLES for r in culprit.roles):
+            log.info("owner_guard: %s has an exempt role - not punished", culprit_id)
+            return
         vname = victim.mention if victim else f"<@{victim_id}>"
         emb = discord.Embed(title="Owner protection", color=RED, timestamp=dt.datetime.now(dt.timezone.utc))
         emb.add_field(name="Protected member", value=vname, inline=True)
@@ -176,7 +187,9 @@ class OwnerGuard(commands.Cog):
             return await self._report(guild, emb)
 
         reason = None
-        if culprit.guild_permissions.administrator:
+        if culprit.id == guild.owner_id:
+            reason = "they are the server owner (Discord can't time out the owner)"
+        elif culprit.guild_permissions.administrator:
             reason = "they have the Administrator permission (Discord can't time out administrators)"
         elif guild.me.top_role <= culprit.top_role:
             reason = "their top role is not below mine - move my role higher"
@@ -216,7 +229,7 @@ class OwnerGuard(commands.Cog):
     @commands.guild_only()
     async def guard(self, ctx: commands.Context, action: str = "status", value: str = ""):
         """owner only: !guard status | on | off | minutes 60 | dry on | dry off"""
-        if ctx.author.id != ctx.guild.owner_id:
+        if ctx.author.id not in self._protected(ctx.guild) and ctx.author.id != ctx.guild.owner_id:
             return
         a, v = action.lower(), value.lower()
         if a == "on":
@@ -232,7 +245,7 @@ class OwnerGuard(commands.Cog):
         ch = ctx.guild.get_channel(LOG_ID) if LOG_ID else None
         await ctx.reply(
             f"Owner protection is **{'ON' if self.on else 'OFF'}**{' (dry run: report only)' if self.dry else ''} - "
-            f"timeout **{self.minutes} min** - alerts go to {ch.mention if ch else 'your DMs (set OWNER_GUARD_LOG_ID)'}.",
+            f"timeout **{self.minutes} min** - protecting {', '.join(f'<@{i}>' for i in sorted(self._protected(ctx.guild)))} - alerts go to {ch.mention if ch else 'your DMs (set OWNER_GUARD_LOG_ID)'}.",
             mention_author=False,
         )
 
