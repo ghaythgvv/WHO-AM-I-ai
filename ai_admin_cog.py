@@ -394,6 +394,27 @@ def _norm(s):
     return re.sub(r"[\W_]+", "", s)
 
 
+def _stamp(o):
+    """tool results -> the model never sees raw unix numbers (it mangled them: '20 days ago' became '4 years ago').
+    Every `x_unix` / `unix` number becomes a ready-made Discord timestamp under the key `x`."""
+    if isinstance(o, dict):
+        new = {}
+        for k, v in o.items():
+            if isinstance(v, int) and not isinstance(v, bool) and (k == "unix" or k.endswith("_unix")):
+                base = "time" if k == "unix" else (k[:-5].rstrip("_") or "time")
+                try:
+                    utc = dt.datetime.fromtimestamp(v, dt.timezone.utc)
+                    new[base] = f"<t:{v}:R> (UTC {utc:%Y-%m-%d %H:%M})"
+                except (OverflowError, OSError, ValueError):
+                    new[base] = "unknown"
+            else:
+                new[k] = _stamp(v)
+        return new
+    if isinstance(o, list):
+        return [_stamp(x) for x in o]
+    return o
+
+
 def _get(diff, name):
     return getattr(diff, name, MISSING)
 
@@ -791,7 +812,10 @@ class AIAdmin(commands.Cog):
             "STYLE: short and direct, Discord markdown, no filler, lists of max ~15 lines (say '+N more'). "
             "NEVER use markdown tables (Discord can't render them, they show as raw | lines) - use one short line per item, "
             "like '- **Mod** - 3 bans', and write target names as plain names. "
-            "Times as <t:UNIX:R> using the unix value from the tool. Mention people by name (id if useful). "
+            "TIMES: tools give ready-made timestamps like '<t:1700000000:R> (UTC 2023-11-14 22:13)'. Copy them EXACTLY as given - "
+            "never calculate, round or guess a time or an age, never write 'approx.', never turn them into 'X years ago' yourself. "
+            "Only state what the tool returned: list ALL roles it gives, don't invent activity or other details. "
+            "Mention people by name (id if useful). "
             "CONTEXT: 'here', 'this channel', 'that channel', 'this chat' = the current channel unless another one is named - "
             "never ask which channel in that case. 'him/her/them' = the person discussed last or the replied-to author. "
             "References like @Name (id N) or #channel (id N) in the message are exact. "
@@ -915,7 +939,7 @@ class AIAdmin(commands.Cog):
                         {
                             "role": "tool",
                             "tool_call_id": tc.id,
-                            "content": json.dumps(out, ensure_ascii=False, default=str)[:3000],
+                            "content": json.dumps(_stamp(out), ensure_ascii=False, default=str)[:3000],
                         }
                     )
                     if isinstance(out, dict) and out.get("cancelled"):
