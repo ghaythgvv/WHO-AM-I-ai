@@ -12,6 +12,11 @@ What it fixes
   4. automation tools (loops, rules, welcome, bump alert v2) are registered even if the old patch did not apply
   5. "I'm not able to ..." counts as a refusal (the AI is pushed to really try the tool)
   6. the AI may only create / remove an automation when your CURRENT message asks for it
+  7. Groq error "tool call validation failed ... /reason: expected string, but got null" (the model passes null for an
+     optional field): the bad call is repaired (nulls dropped) and run, instead of "I didn't understand that one"
+  8. a reply that is ONLY a mention of the bot (an answer to "which member?") no longer gets "Yo! How can I help?" - it is
+     understood as "you, the bot"; "came to my vc" / "ta3al" work like "come"; the bot remembers more of the conversation
+  9. loads owner_guard.py by itself if it is in the same folder (one load line is enough)
 
 !aicheck (administrator) prints a short health report: what is loaded, ffmpeg/opus, bump settings.
 
@@ -19,13 +24,19 @@ LOAD IT LAST (after ai_admin_cog, auto_cog, voice_cog):   await bot.load_extensi
 You can delete the "[patch]" block in your main file and patch_ai_admin*.py - this file replaces them.
 """
 
+import asyncio
 import importlib.util
+import json
 import logging
 import random
 import re
 import shutil
+import uuid
+from collections import defaultdict, deque
+from types import SimpleNamespace
 
 import discord
+import openai
 from discord.ext import commands
 
 log = logging.getLogger("ai_fix")
@@ -33,6 +44,9 @@ log = logging.getLogger("ai_fix")
 VOICE_MISSING = "voice_cog isn't loaded - add  await bot.load_extension('voice_cog')  in your main file."
 
 EXTRA_PROMPT = (
+    " If the staff member answers a question of yours with only a mention of you (the bot), or with 'u' / 'you', they mean YOU, "
+    "the bot - for 'come / join / came to my vc' use bot_join_voice, never voice_action. "
+    " TOOL ARGUMENTS: leave optional arguments OUT - never pass null for them. "
     " NEVER create, change or remove an automation (auto_add / auto_remove / auto_toggle / set_bump_alert) unless the "
     "staff member's CURRENT message clearly asks for it - earlier messages in the history are finished, never repeat "
     "them. A question or a request to look something up is never an automation. "
@@ -53,12 +67,12 @@ _VQ_UNFOLLOW = re.compile(
     rf"^\s*{_V_PRE}(?:unfollow(?:\s+me)?|stop\s+follow(?:ing)?(?:\s+me)?|don['’]?t\s+follow(?:\s+me)?){_V_POST}", re.I
 )
 _VQ_JOIN = re.compile(
-    rf"^\s*{_V_PRE}(?:come|join)(?:\s+(?:to|in|into))?"
+    rf"^\s*{_V_PRE}(?:come|came|coem|com|join|jion|ta3al|ta3a|تعال)(?:\s+(?:to|in|into))?"
     r"(?:\s+(?:me|us|here|(?:my|the)\s*(?:vc|voice(?:\s*chat|\s*channel)?|channel|room)|vc|voice(?:\s*chat|\s*channel)?))?"
     rf"{_V_POST}",
     re.I,
 )
-_VQ_JOINCH = re.compile(rf"^\s*{_V_PRE}(?:come|join)(?:\s+(?:to|in|into))?\s+(?P<c>.+?){_V_POST}", re.I)
+_VQ_JOINCH = re.compile(rf"^\s*{_V_PRE}(?:come|came|coem|com|join|jion|ta3al|ta3a|تعال)(?:\s+(?:to|in|into))?\s+(?P<c>.+?){_V_POST}", re.I)
 _VQ_LEAVE = re.compile(
     rf"^\s*{_V_PRE}(?:leave|disconnect|get\s+out|go\s+out)"
     r"(?:\s+(?:the\s+|my\s+|from\s+(?:the\s+)?)?(?:vc|voice(?:\s*chat|\s*channel)?|channel))?"
@@ -216,6 +230,103 @@ class AIFix(commands.Cog):
 
         ai._agent = _agent
         ai._system = lambda ctx: orig_system(ctx) + EXTRA_PROMPT
+        ai._complete = self._complete  # same as the original, plus the repair of "got null" tool calls
+
+        # remember more of the conversation (the original keeps only the last 4 exchanges)
+        bigger = defaultdict(lambda: deque(maxlen=12))
+        for k, v in ai.history.items():
+            bigger[k].extend(v)
+        ai.history = bigger
+
+        # "@bot" alone as the answer to the bot's own question must not reset the chat with "Yo! How can I help?"
+        orig_on_message = ai.on_message
+        self.bot.remove_listener(orig_on_message, "on_message")
+
+        async def on_message(message):
+            try:
+                if await fix._bare_mention(message):
+                    return
+            except Exception:
+                log.exception("ai_fix bare mention failed")
+            await orig_on_message(message)
+
+        self.bot.add_listener(on_message, "on_message")
+
+    async def _bare_mention(self, message):
+        """True if this message was a reply to a QUESTION of the bot containing nothing but a mention of the bot"""
+        ai, me = self.ai, self.bot.user
+        if message.author.bot or not message.guild or message.content.startswith("!") or me not in message.mentions:
+            return False
+        if re.sub(rf"<@!?{me.id}>", "", message.content).strip():
+            return False
+        ref = message.reference
+        replied = ref.resolved if ref is not None and isinstance(ref.resolved, discord.Message) else None
+        if replied is None or replied.author.id != me.id or "?" not in (replied.content or ""):
+            return False
+        if not ai._authorized(message.author):
+            return False
+        await ai._handle(message, f"@{me.display_name} (id {me.id}) - that is you, the bot", replied)
+        return True
+
+    # ------------------------------------------------------------------ AI call with repair
+    @staticmethod
+    def _recover(e):
+        """Groq rejected a tool call because an optional argument was null -> rebuild the call without the nulls"""
+        text = str(e)
+        if "null" not in text:
+            return None
+        body = getattr(e, "body", None)
+        fg = body.get("failed_generation") if isinstance(body, dict) else None
+        if not fg:
+            mm = re.search(r"'failed_generation': '(.*)'\}", text, re.S)
+            fg = mm.group(1).encode().decode("unicode_escape") if mm else None
+        if not isinstance(fg, str) or "{" not in fg:
+            return None
+        try:
+            obj = json.loads(fg[fg.index("{"): fg.rindex("}") + 1])
+            name, args = obj["name"], obj.get("arguments", {})
+            if isinstance(args, str):
+                args = json.loads(args or "{}")
+            if not isinstance(name, str) or not isinstance(args, dict):
+                return None
+        except (ValueError, KeyError, TypeError):
+            return None
+        args = {k: v for k, v in args.items() if v is not None}
+        tc = SimpleNamespace(id="call_" + uuid.uuid4().hex[:10], type="function",
+                             function=SimpleNamespace(name=name, arguments=json.dumps(args)))
+        log.info("ai_fix: repaired a tool call with null arguments: %s %s", name, args)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[tc]))])
+
+    async def _complete(self, msgs, tools):
+        ai = self.ai
+        import ai_admin_cog as m
+
+        model, plain, switched, bad, net = m.MODEL, False, False, 0, 0
+        while True:
+            try:
+                return await ai.ai.chat.completions.create(
+                    model=model, max_tokens=1500, temperature=0.3, messages=msgs, tools=tools, tool_choice="auto",
+                    **ai._extra(model, plain),
+                )
+            except openai.RateLimitError:
+                # limits are per model: if the main one is used up, the backup model still has room
+                if switched or not m.FALLBACK_MODEL or m.FALLBACK_MODEL == model:
+                    raise
+                model, switched = m.FALLBACK_MODEL, True
+            except openai.BadRequestError as e:
+                fixed = self._recover(e)
+                if fixed is not None:
+                    return fixed
+                bad += 1  # the model sometimes writes a broken tool call - retry
+                if bad > 2:
+                    raise
+                plain = True
+                await asyncio.sleep(0.5)
+            except (openai.APIConnectionError, openai.InternalServerError):
+                net += 1
+                if net > 1:
+                    raise
+                await asyncio.sleep(1)
 
     # ------------------------------------------------------------------ voice tools (the AI calls these)
     def _voice(self):
@@ -351,6 +462,7 @@ class AIFix(commands.Cog):
             f"edge-tts: {ok(importlib.util.find_spec('edge_tts'))} | yt-dlp: {ok(importlib.util.find_spec('yt_dlp'))}"
             f" | PyNaCl: {ok(importlib.util.find_spec('nacl'))}",
         ]
+        lines.append(f"owner protection (!guard): {ok(self.bot.get_cog('OwnerGuard'))}")
         if auto is not None:
             b = auto.data["bump"]
             lines.append(
@@ -362,3 +474,5 @@ class AIFix(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(AIFix(bot))
+    if "owner_guard" not in bot.extensions and importlib.util.find_spec("owner_guard") is not None:
+        await bot.load_extension("owner_guard")  # so ONE load line in your main file is enough
