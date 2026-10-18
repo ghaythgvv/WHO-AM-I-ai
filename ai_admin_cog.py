@@ -173,6 +173,11 @@ HELP_TEXT = (
 MEMBER_HELP = "Hey! How can I help you?"  # members only see this - never the admin command list
 MEMBER_ERROR = "I can't answer right now - try again in a moment."
 NO_TASKS = "Only the owner and roles above mine can give me tasks."
+# fixed answers: (pattern on the NORMALIZED question - lowercase letters and digits only - , answer). Add your own lines here.
+CUSTOM_ANSWERS = [
+    (re.compile(r"^who(?:is|s)(?:the)?divine(?:id\d{15,20})?$"), "Divine is the wife of WHO AM I \U0001F48D"),
+    (re.compile(r"^who(?:is|s)(?:the)?(?:id)?1409286570476961803$"), "Divine is the wife of WHO AM I \U0001F48D"),
+]
 _HELP_RE = re.compile(r"^\s*(?:help|commands|what can you do\??|how (?:do i|to) use (?:you|this))\s*$", re.I)
 _MUTED_RE = re.compile(
     r"^\s*(?:(?:who(?:\s+is|\s+are|'s|s))|(?:list|show(?:\s+me)?))\s+(?:all\s+)?(?:the\s+)?(?:currently\s+|right\s+now\s+)?"
@@ -591,6 +596,14 @@ class AIAdmin(commands.Cog):
             return False
         return m.id == g.owner_id or m.top_role > g.me.top_role
 
+    def _custom_answer(self, guild, text):
+        """a fixed answer from CUSTOM_ANSWERS (e.g. 'who is divine'), or None"""
+        n = _norm(self._humanize(guild, text))
+        for pat, ans in CUSTOM_ANSWERS:
+            if pat.match(n):
+                return ans
+        return None
+
     def _wants_other_lang(self, ctx, text):
         """True while this person asked the bot to speak another language (until they say 'speak english')"""
         key = (ctx["channel"].id, ctx["author"].id)
@@ -760,6 +773,9 @@ class AIAdmin(commands.Cog):
         """answer somebody who can't give tasks. Chat only: NO tools are ever passed to the model here."""
         if not text.strip() or _HELP_RE.match(text):
             return MEMBER_HELP
+        custom = self._custom_answer(ctx["guild"], text)
+        if custom:
+            return custom
         if not AI_API_KEY:
             return MEMBER_ERROR
         self._wants_other_lang(ctx, text)
@@ -905,6 +921,10 @@ class AIAdmin(commands.Cog):
         if not self._authorized(ctx["author"]):  # tasks (tools, quick actions) are for owner / above-bot roles only
             return NO_TASKS
         self._wants_other_lang(ctx, text)
+        custom = self._custom_answer(ctx["guild"], text)
+        if custom:
+            self._remember(ctx, text, custom)
+            return custom
         quick = (
             self._quick_help(text)
             or await self._quick_muted(ctx, text)
