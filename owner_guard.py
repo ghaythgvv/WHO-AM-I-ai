@@ -35,8 +35,13 @@ OPTIONAL RAILWAY VARIABLES
   OWNER_GUARD_EXEMPT_ROLE_IDS  role id(s) whose members are never punished (default: 1434612242451529878)
   OWNER_GUARD_WITH_OWNER   1 = the server owner is protected too (default 0)
   OWNER_GUARD_DRY_RUN      1 = only report, never time out
+  OWNER_GUARD_DEBUG        1 = also report when you were moved/disconnected but nobody could be found
 
-COMMAND (you or the owner):  !guard status | on | off | minutes 60 | dry on | dry off     (changes last until the bot restarts;
+IF "NOTHING HAPPENS" when somebody moves you: type  !guard debug on  and let them move you again. If the bot finds no
+audit entry it posts what it did see (who, which channel, how old), so we can tell what Discord reports. Also check that the
+bot has View Audit Log and that the logs show "owner_guard: ready" after the deploy.
+
+COMMAND (you or the owner):  !guard status | on | off | minutes 60 | dry on | dry off | debug on | debug off     (changes last until the bot restarts;
                        set the Railway variables to make them permanent)
 """
 
@@ -83,7 +88,9 @@ class OwnerGuard(commands.Cog):
         self.on = _flag("OWNER_GUARD", True)
         self.dry = _flag("OWNER_GUARD_DRY_RUN", False)
         self.minutes = max(1, min(_num("OWNER_GUARD_MINUTES", 5), 40320))
-        self.seen = deque(maxlen=200)  # audit entries already handled
+        self.debug = _flag("OWNER_GUARD_DEBUG", False)
+        self.seen = deque(maxlen=200)  # audit entries already handled (mute / deafen)
+        self.counts = {}  # move / disconnect audit entry id -> the count we already know (Discord merges repeats into one entry)
         self._bg = set()
 
     def _spawn(self, coro):
@@ -91,9 +98,34 @@ class OwnerGuard(commands.Cog):
         self._bg.add(t)
         t.add_done_callback(self._bg.discard)
 
+    async def cog_load(self):
+        log.info("owner_guard: ready - protecting %s, timeout %s min, dry run %s, debug %s",
+                 sorted(PROTECT), self.minutes, self.dry, self.debug)
+        self._spawn(self._baseline())
+
     async def cog_unload(self):
         for t in list(self._bg):
             t.cancel()
+
+    def _remember(self, e):
+        self.counts[e.id] = int(getattr(e.extra, "count", 1) or 1)
+        while len(self.counts) > 500:
+            self.counts.pop(next(iter(self.counts)))
+
+    async def _baseline(self):
+        """remember the counts of the existing move / disconnect entries, so a repeated move (which Discord adds to the
+        SAME entry instead of making a new one) can be recognised"""
+        await self.bot.wait_until_ready()
+        for g in self.bot.guilds:
+            if not g.me.guild_permissions.view_audit_log:
+                log.warning("owner_guard: %s - I need the View Audit Log permission", g.name)
+                continue
+            for action in (A.member_move, A.member_disconnect):
+                try:
+                    async for e in g.audit_logs(limit=25, action=action):
+                        self._remember(e)
+                except discord.HTTPException:
+                    pass
 
     def _protected(self, guild):
         ids = set(PROTECT)
@@ -134,28 +166,51 @@ class OwnerGuard(commands.Cog):
             self._spawn(self._check_voice(member, "disconnected", None))
 
     async def _check_voice(self, member, kind, dest):
-        await asyncio.sleep(1.5)  # the audit entry shows up a moment after the voice event
         g = member.guild
         if not g.me.guild_permissions.view_audit_log:
             log.warning("owner_guard: I need the View Audit Log permission")
+            if self.debug:
+                await self._note(g, "I can't read the audit log - give the bot the **View Audit Log** permission.")
             return
         action = A.member_move if kind == "moved" else A.member_disconnect
-        now = dt.datetime.now(dt.timezone.utc)
-        try:
-            async for e in g.audit_logs(limit=15, action=action):  # newest first
-                if (now - e.created_at).total_seconds() > 7:
-                    break
-                if e.id in self.seen:
-                    continue
-                if kind == "moved":
-                    ch = getattr(e.extra, "channel", None)
-                    if ch is None or dest is None or ch.id != dest.id:
-                        continue
-                self.seen.append(e.id)
-                await self._punish(g, member, member.id, e.user_id, kind + " from voice")
+        started = dt.datetime.now(dt.timezone.utc)
+        rows = []
+        for wait in (1.5, 1.5, 2, 3, 4):  # the audit entry can take a few seconds: look again at 1.5, 3, 5, 8 and 12 s
+            await asyncio.sleep(wait)
+            hit, rows = await self._find_entry(g, action, kind, dest, started)
+            if hit is not None:
+                await self._punish(g, member, member.id, hit.user_id, kind + " from voice")
                 return
+        if self.debug:
+            seen = "\n".join(rows[:6]) or "no entries at all"
+            await self._note(
+                g, f"{member.mention} was **{kind}** but I found no matching audit entry (maybe you did it yourself).\n"
+                   f"Latest `{kind}` entries I saw:\n{seen}",
+            )
+
+    async def _find_entry(self, g, action, kind, dest, started):
+        """(entry, rows): an audit entry that is NEW (created around the event) or whose count went UP (a repeat that
+        Discord merged into an older entry). For moves it must also point at the channel the owner landed in."""
+        hit, rows = None, []
+        try:
+            async for e in g.audit_logs(limit=15, action=action):
+                count = int(getattr(e.extra, "count", 1) or 1)
+                prev = self.counts.get(e.id)
+                ch = getattr(e.extra, "channel", None)
+                age = (dt.datetime.now(dt.timezone.utc) - e.created_at).total_seconds()
+                rows.append(f"- <@{e.user_id}> count {count}" + (f" -> <#{ch.id}>" if ch is not None else "") + f", {int(age)}s old")
+                fresh = prev is None and e.created_at >= started - dt.timedelta(seconds=5)
+                bumped = prev is not None and count > prev
+                ok_channel = kind != "moved" or (ch is not None and dest is not None and ch.id == dest.id)
+                self._remember(e)
+                if hit is None and ok_channel and (fresh or bumped):
+                    hit = e
         except discord.HTTPException as ex:
             log.warning("owner_guard: couldn't read the audit log: %s", ex)
+        return hit, rows
+
+    async def _note(self, guild, text):
+        await self._report(guild, discord.Embed(title="Owner protection (debug)", description=text, color=ORANGE))
 
     # ------------------------------------------------------------------ the punishment
     async def _punish(self, guild, victim, victim_id, culprit_id, what):
@@ -240,11 +295,13 @@ class OwnerGuard(commands.Cog):
             self.minutes = max(1, min(int(v), 40320))
         elif a == "dry" and v in ("on", "off"):
             self.dry = v == "on"
+        elif a == "debug" and v in ("on", "off"):
+            self.debug = v == "on"
         elif a != "status":
-            return await ctx.reply("Use `!guard status`, `on`, `off`, `minutes 60` or `dry on/off`.", mention_author=False)
+            return await ctx.reply("Use `!guard status`, `on`, `off`, `minutes 60`, `dry on/off` or `debug on/off`.", mention_author=False)
         ch = ctx.guild.get_channel(LOG_ID) if LOG_ID else None
         await ctx.reply(
-            f"Owner protection is **{'ON' if self.on else 'OFF'}**{' (dry run: report only)' if self.dry else ''} - "
+            f"Owner protection is **{'ON' if self.on else 'OFF'}**{' (dry run: report only)' if self.dry else ''}{' (debug on)' if self.debug else ''} - "
             f"timeout **{self.minutes} min** - protecting {', '.join(f'<@{i}>' for i in sorted(self._protected(ctx.guild)))} - alerts go to {ch.mention if ch else 'your DMs (set OWNER_GUARD_LOG_ID)'}.",
             mention_author=False,
         )
