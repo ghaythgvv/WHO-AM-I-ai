@@ -24,6 +24,9 @@ What it fixes
  12. Railway volume: if a volume is mounted, automations are saved on it (RAILWAY_VOLUME_MOUNT_PATH) - they survive
      redeploys and the "Railway wipes files" warning disappears
   9. loads owner_guard.py by itself if it is in the same folder (one load line is enough)
+ 13. EXTRA ALLOWED ROLES: set the Railway variable AI_ALLOWED_ROLE_IDS (role ids separated by commas) and members with
+     one of those roles may use the AI admin too (on top of whoever the original check already allows).
+     Only give it to staff roles you trust - the AI admin can moderate.
 
 !aicheck (administrator) prints a short health report: what is loaded, ffmpeg/opus, bump settings.
 
@@ -262,6 +265,12 @@ class AIFix(commands.Cog):
 
         ai._agent = _agent
         ai._system = lambda ctx: orig_system(ctx) + EXTRA_PROMPT
+
+        # extra roles that may use the AI admin (Railway variable AI_ALLOWED_ROLE_IDS = 111,222)
+        orig_auth = ai._authorized
+        allowed = {int(x) for x in os.getenv("AI_ALLOWED_ROLE_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+        ai._authorized = lambda member: orig_auth(member) or any(r.id in allowed for r in getattr(member, "roles", []))
+
         # while automations exist the AI always sees list / remove / pause (before: "I have no tool for that")
         import ai_admin_cog as m
 
