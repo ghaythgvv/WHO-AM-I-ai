@@ -1,10 +1,13 @@
 """
-patch_ai_admin_2.py - run AFTER patch_ai_admin.py.  Fixes "he only does it when I ask a second time":
-  1. the automation tools are always offered to the AI (before, a message without the right keywords never saw them)
-  2. an answer like "sure / I'll do it / done" where NO tool was called gets the same push-retry as a refusal
+patch_ai_admin_2.py  -  NEW CONTENT. Overwrite your old patch_ai_admin_2.py with this file (same name).
 
-    python patch_ai_admin_2.py                 (next to ai_admin_cog.py)
-Makes ai_admin_cog.py.bak2 first; writes nothing if a step doesn't match.
+Your main file already runs this file on every start, so this needs NO change in the main file:
+it makes ai_admin_cog.py load ai_fix.py (and, through it, owner_guard.py) a moment after the bot is ready.
+
+You only have to put these files in the same folder as ai_admin_cog.py:
+    ai_fix.py   owner_guard.py   patch_ai_admin_2.py (this one, overwriting the old one)
+
+If you ALSO load ai_fix in your main file, nothing breaks: it is only loaded once.
 """
 import pathlib
 import shutil
@@ -14,30 +17,37 @@ path = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "ai_admin_cog.py")
 if not path.exists():
     sys.exit(f"Can't find {path}.")
 src = path.read_text(encoding="utf-8").replace("\r\n", "\n")
-if "LAZY_RE" in src:
-    sys.exit("Already patched. Nothing to do.")
-if "auto_cog" not in src:
-    sys.exit("Run patch_ai_admin.py first.")
+if "_load_ai_fix" in src:
+    sys.exit("Already installed. Nothing to do.")
 
+OLD = "async def setup(bot: commands.Bot):\n    await bot.add_cog(AIAdmin(bot))"
+if src.count(OLD) != 1:
+    sys.exit(f"PATCH FAILED - setup() not found exactly once (found {src.count(OLD)}). Nothing was changed.")
 
-def once(text, old, new, label):
-    if text.count(old) != 1:
-        sys.exit(f"PATCH FAILED - {label}: expected 1 match, found {text.count(old)}. Nothing was changed.")
-    return text.replace(old, new, 1)
+NEW = '''async def setup(bot: commands.Bot):
+    await bot.add_cog(AIAdmin(bot))
 
+    # ---- added by patch_ai_admin_2.py: load ai_fix.py (voice, automations, bump ping, owner protection ...) once the bot is ready
+    async def _load_ai_fix():
+        try:
+            await bot.wait_until_ready()
+            if "ai_fix" not in bot.extensions:
+                await bot.load_extension("ai_fix")
+        except Exception:
+            log.exception("ai_fix.py could not be loaded - is it in the same folder as ai_admin_cog.py?")
 
-src = once(src, "    CONFIRM_TOOLS |= AUTO_CONFIRM\n",
-           "    CONFIRM_TOOLS |= AUTO_CONFIRM\n    BASE_TOOLS |= AUTO_TOOL_NAMES  # always offered, so the AI never says 'not supported' before seeing them\n",
-           "base tools")
-src = once(src, "NUDGE = (\n",
-           'LAZY_RE = re.compile(r"^\\s*(?:sure|ok(?:ay)?|alright|got it|done|yes|i[\'’]?ll|i will|i[\'’]?ve|created|setting)\\b", re.I)\n'
-           "NUDGE = (\n", "lazy regex")
-src = once(src, "(not content or REFUSAL_RE.match(content))",
-           "(not content or REFUSAL_RE.match(content) or LAZY_RE.match(content))", "nudge condition")
+    bot._ai_fix_task = asyncio.create_task(_load_ai_fix())'''
+src = src.replace(OLD, NEW, 1)
+
 try:
     compile(src, str(path), "exec")
 except SyntaxError as e:
-    sys.exit(f"PATCH FAILED - result would not compile ({e}). Nothing was changed.")
+    sys.exit(f"PATCH FAILED - the result would not compile ({e}). Nothing was changed.")
+
 shutil.copyfile(path, str(path) + ".bak2")
 path.write_text(src, encoding="utf-8")
-print("Patched OK. Backup:", str(path) + ".bak2", "- redeploy.")
+folder = path.resolve().parent
+missing = [f for f in ("ai_fix.py", "owner_guard.py") if not (folder / f).exists()]
+print("Installed OK. Backup:", str(path) + ".bak2")
+if missing:
+    print("WARNING - these files are not next to ai_admin_cog.py yet:", ", ".join(missing))
