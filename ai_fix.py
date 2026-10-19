@@ -16,6 +16,13 @@ What it fixes
      optional field): the bad call is repaired (nulls dropped) and run, instead of "I didn't understand that one"
   8. a reply that is ONLY a mention of the bot (an answer to "which member?") no longer gets "Yo! How can I help?" - it is
      understood as "you, the bot"; "came to my vc" / "ta3al" work like "come"; the bot remembers more of the conversation
+ 10. BUMP PING: STAFF and UT STAFF are tagged when it is time to bump again (DISBOARD's cooldown = 120 min). The bump itself
+     gets a quiet thank-you + the next bump time (the waiting reminder turns into it). One-time default set by this file:
+     remind 120 min, no ping at the bump. Say "bump alert: ping right after every bump" if you want that too.
+ 11. "take it off" / "remove r1" / "pause r2" / "list automations" work instantly (no AI call, no free-limit problem), and
+     the AI always sees the automation tools while automations exist - it no longer says "I have no tool for that"
+ 12. Railway volume: if a volume is mounted, automations are saved on it (RAILWAY_VOLUME_MOUNT_PATH) - they survive
+     redeploys and the "Railway wipes files" warning disappears
   9. loads owner_guard.py by itself if it is in the same folder (one load line is enough)
 
 !aicheck (administrator) prints a short health report: what is loaded, ffmpeg/opus, bump settings.
@@ -28,9 +35,11 @@ import asyncio
 import importlib.util
 import json
 import logging
+import os
 import random
 import re
 import shutil
+import time
 import uuid
 from collections import defaultdict, deque
 from types import SimpleNamespace
@@ -95,6 +104,16 @@ _GREET = re.compile(
     r"\s*(?:yo+|hey+|hi+|hello+|hiya|sup|wassup|what'?s up|salam|salut|hola|bonjour|slm|ahla|aslema|3aslema)\s*[!.?]*\s*", re.I
 )
 
+_FILLER = r"(?:(?:ok(?:ay)?|nice|good|great|thanks?|thx|cool|now|alright|and|then|so|yo|hey|bro|please|pls|plz|u|you)[\s,!.]+)*"
+_AQ_LIST = re.compile(
+    rf"^\s*{_FILLER}(?:list|show)(?:\s+me)?\s+(?:all\s+|my\s+|the\s+)?(?:automations?|loops?|rules?)\s*[!.?]*\s*$", re.I
+)
+_AQ_VERB = re.compile(
+    rf"^\s*{_FILLER}(?P<v>take\s+it\s+off|take\s+off|turn\s+(?:it\s+)?off|remove|delete|cancel|kill|end|stop|pause|resume|unpause|start)"
+    r"(?P<rest>\s+.*)?$",
+    re.I | re.S,
+)
+
 VOICE_TOOL_METHODS = (
     "t_bot_join_voice", "t_bot_follow", "t_bot_unfollow", "t_bot_leave_voice", "t_bot_voice_status", "t_bot_speak",
     "t_bot_music",
@@ -151,9 +170,17 @@ class AIFix(commands.Cog):
         ai._ai_fix_done = True
         self._tools(m)
         self._bump(ai)
+        auto = self.bot.get_cog("Automation")
+        if auto is not None:
+            self._fix_bump(auto, ai)
+            try:
+                await self._volume(auto)
+            except Exception:
+                log.exception("ai_fix: volume setup failed")
+            self._bump_defaults(auto)
         self._bind(ai)
         self._wrap(ai)
-        log.info("ai_fix: installed (voice tools, automation tools, old bump alert off)")
+        log.info("ai_fix: installed (voice tools, automation tools, bump ping, old bump alert off)")
 
     def _tools(self, m):
         names, new = set(), []
@@ -169,6 +196,11 @@ class AIFix(commands.Cog):
         names = {t["function"]["name"] for t in new}
         m.TOOLS[:] = [t for t in m.TOOLS if t["function"]["name"] not in names] + new  # in place: other code holds this list
         m.TOOL_NAMES = set(m.TOOL_NAMES) | names
+        for t in m.TOOLS:  # ping_now now means: tag the roles right after EVERY bump
+            if t["function"]["name"] == "set_bump_alert":
+                pr = t["function"]["parameters"].get("properties", {})
+                if "ping_now" in pr:
+                    pr["ping_now"]["description"] = "tag the roles right after EVERY bump (default true); false = quiet thank-you"
         m.INT_ARGS = tuple(dict.fromkeys(tuple(m.INT_ARGS) + ("every_seconds", "delete_after_seconds", "volume")))
         m.BOOL_ARGS = tuple(dict.fromkeys(tuple(m.BOOL_ARGS) + ("dm", "include_bots")))
         m.TOOL_GROUPS.append((
@@ -220,7 +252,7 @@ class AIFix(commands.Cog):
         async def _agent(ctx, text):
             try:
                 if ai._authorized(ctx["author"]):
-                    quick = fix._quick_greet(text) or await fix._quick_voice(ctx, text)
+                    quick = fix._quick_greet(text) or await fix._quick_voice(ctx, text) or await fix._quick_auto(ctx, text)
                     if quick:
                         ai._remember(ctx, text, quick)
                         return quick
@@ -230,6 +262,21 @@ class AIFix(commands.Cog):
 
         ai._agent = _agent
         ai._system = lambda ctx: orig_system(ctx) + EXTRA_PROMPT
+        # while automations exist the AI always sees list / remove / pause (before: "I have no tool for that")
+        import ai_admin_cog as m
+
+        orig_tools_for = ai._tools_for
+
+        def _tools_for(text):
+            tools = orig_tools_for(text)
+            auto = fix.bot.get_cog("Automation")
+            if auto is not None and auto.data["rules"] and tools is not m.TOOLS:
+                have = {t["function"]["name"] for t in tools}
+                want = ("auto_list", "auto_remove", "auto_toggle")
+                tools = list(tools) + [t for t in m.TOOLS if t["function"]["name"] in want and t["function"]["name"] not in have]
+            return tools
+
+        ai._tools_for = _tools_for
         ai._complete = self._complete  # same as the original, plus the repair of "got null" tool calls
 
         # remember more of the conversation (the original keeps only the last 4 exchanges)
@@ -444,6 +491,165 @@ class AIFix(commands.Cog):
             return None
         return self.ai._quick_result(await self.ai._dispatch(call[0], call[1], ctx))
 
+    # ------------------------------------------------------------------ bump alert: ping on every bump
+    def _fix_bump(self, auto, ai):
+        cfg_of = lambda: auto.data["bump"]  # noqa: E731
+
+        async def _bump_handle(m):
+            cfg, ch, g = cfg_of(), m.channel, m.guild
+            await asyncio.sleep(random.uniform(0.2, 1.2))  # a 2nd copy of the bot: the slower one sees the answer and stops
+            if await auto._bump_answered(m):
+                log.info("bump alert: already answered by another copy of the bot, skipping")
+                return
+            roles = auto._bump_roles(g)
+            if not roles:
+                log.warning("bump alert: none of the configured roles exist in this server")
+                return
+            who = auto._bumper(m)
+            count = 0
+            if who is not None:
+                k = str(who.id)
+                cfg["counts"][k] = cfg["counts"].get(k, 0) + 1
+                count = cfg["counts"][k]
+            cid = str(ch.id)
+            due = int(time.time()) + cfg["remind"] * 60 if cfg["remind"] > 0 else 0
+            thanks = auto._thanks(who, count, due)
+            ping = bool(cfg["now"])
+            waiting = await auto._find_reminder(ch)
+            sent = False
+            if waiting is not None:
+                if ping:
+                    await auto._del(waiting)  # the new message pings the roles - the old reminder just goes away
+                else:
+                    try:
+                        await waiting.edit(content=thanks, allowed_mentions=discord.AllowedMentions.none())
+                        sent = True
+                    except discord.HTTPException:
+                        sent = False
+            if not sent:
+                try:
+                    await ch.send(
+                        (" ".join(r.mention for r in roles) + " " if ping else "") + thanks,
+                        allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=roles if ping else False),
+                    )
+                except discord.HTTPException as e:
+                    log.warning("bump alert: couldn't post in #%s: %s", getattr(ch, "name", "?"), e)
+            cfg["msg"].pop(cid, None)
+            if due:
+                cfg["due"][cid] = due
+                auto._schedule_reminder(ch.id, due)
+            else:
+                cfg["due"].pop(cid, None)
+                auto._cancel_reminder(ch.id)
+            auto._dirty()
+
+        auto._bump_handle = _bump_handle
+
+        # the status text of the tool must describe the NEW behaviour
+        orig = auto.t_set_bump_alert
+
+        async def t_set_bump_alert(ctx, channel=None, roles=None, remind_minutes=None, ping_now=None, enabled=None):
+            res = await orig(ctx, channel=channel, roles=roles, remind_minutes=remind_minutes, ping_now=ping_now, enabled=enabled)
+            if isinstance(res, dict) and isinstance(res.get("summary"), str):
+                cfg = cfg_of()
+                sm = res["summary"]
+                sm = re.sub(r"\n- \*\*\d+ min\*\* after a bump I tag the roles once[^\n]*",
+                            f"\n- **{cfg['remind']} min** after a bump I tag the roles: \"time to bump again\".", sm)
+                new_line = "\n- I tag the roles right after every bump." if cfg["now"] else "\n- Thank-yous are quiet (no ping at the bump)."
+                if "If nobody was reminded yet" in sm:
+                    sm = re.sub(r"\n- If nobody was reminded yet[^\n]*", new_line, sm)
+                elif cfg["on"] and cfg["roles"]:
+                    sm = sm.replace("\n- I thank the bumper and count their bumps.", "\n- I thank the bumper and count their bumps." + new_line, 1)
+                res["summary"] = sm
+            return res
+
+        auto.t_set_bump_alert = t_set_bump_alert
+        ai.t_set_bump_alert = t_set_bump_alert
+
+    def _bump_defaults(self, auto):
+        """one-time: tag the roles when it is time to bump again (DISBOARD cooldown 120 min), not at the bump itself"""
+        cfg = auto.data["bump"]
+        if cfg.get("fix_v3"):
+            return  # already done once - later changes you make by chat are kept
+        old = int(cfg.get("remind", 0) or 0)
+        cfg["now"], cfg["remind"], cfg["fix_v3"] = False, 120, True
+        delta = (120 - old) * 60 if old > 0 else 0
+        for cid, due in list(cfg["due"].items()):  # a reminder that is already waiting moves to the new cooldown
+            cfg["due"][cid] = int(due) + delta
+            if self.bot.is_ready():
+                auto._schedule_reminder(int(cid), cfg["due"][cid])
+        auto._dirty()
+
+    # ------------------------------------------------------------------ Railway volume
+    async def _volume(self, auto):
+        """a Railway volume is mounted -> keep the automations on it (survives redeploys)"""
+        import auto_cog
+
+        mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
+        if not mount or os.getenv("AUTO_DATA_FILE", "").strip() or not os.path.isdir(mount):
+            return
+        new = os.path.join(mount, "auto_data.json")
+        if os.path.abspath(auto_cog.DATA_FILE) == os.path.abspath(new):
+            return
+        auto_cog.DATA_FILE = new
+        auto._persist_note = lambda: ""  # no more "Railway wipes files" warning
+        if os.path.exists(new):  # saved settings from an earlier run: use them
+            for rid in list(auto.loops):
+                auto._stop_loop(rid)
+            for cid in list(auto.bump_tasks):
+                auto._cancel_reminder(cid)
+            await auto._load()
+            if self.bot.is_ready():
+                await auto._boot()
+        else:
+            auto._dirty()  # first run on the volume: write the current settings there
+        log.info("ai_fix: automations are saved on the Railway volume: %s", new)
+
+    # ------------------------------------------------------------------ automations: instant management
+    async def _quick_auto(self, ctx, text):
+        """list automations / remove r1 / take it off / pause r2 / resume r2 - instant, no AI call"""
+        auto, ai = self.bot.get_cog("Automation"), self.ai
+        if auto is None:
+            return None
+        t = text.strip()
+        if _AQ_LIST.match(t):
+            return ai._quick_result(await ai._dispatch("auto_list", {}, ctx))
+        m = _AQ_VERB.match(t)
+        if not m:
+            return None
+        verb = re.sub(r"\s+", " ", m.group("v").lower())
+        rest = (m.group("rest") or "").strip().lower()
+        rest = re.sub(r"\b(?:from|in|on|at|for)\b.*$", "", rest).strip(" .!?,")  # "... from test" is only a label
+        rest = re.sub(r"^(?:the|that|this|my)\s+", "", rest)
+        rid = re.search(r"\br\d+\b", rest)
+        noun = re.search(r"\b(?:automations?|loops?|rules?)\b", rest)
+        every = re.search(r"\b(?:all|everything|every)\b", rest)
+        rules = auto.data["rules"]
+        if not (rid or noun):  # only "it" / nothing: accept it when we were just talking about an automation
+            hist = ai.history.get(ctx["channel"].id)
+            last = hist[-1].get("content", "") if hist and hist[-1].get("role") == "assistant" else ""
+            if not (rest in ("", "it", "that", "this", "them") and rules and re.search(r"loop|automation|rule|\br\d+\b", last, re.I)):
+                return None
+        if not rules:
+            return "There are no automations."
+        toggle = verb in ("pause", "resume", "unpause", "start")
+        if rid:
+            target = [r for r in rules if r["id"].lower() == rid.group()]
+            if not target:
+                return f"No automation `{rid.group()}`. Existing: " + ", ".join(f"`{r['id']}`" for r in rules)
+        elif every and noun:
+            target = list(rules)
+        else:
+            pool = [r for r in rules if r["kind"] == "loop"] if noun and noun.group().startswith("loop") else rules
+            if len(pool) != 1:
+                return "Which one?\n" + "\n".join("- " + auto._describe(r) for r in (pool or rules)[:10])
+            target = pool
+        if toggle:
+            outs = [await ai._dispatch("auto_toggle", {"rule_id": r["id"], "enabled": verb != "pause"}, ctx) for r in target]
+            return "\n".join(ai._quick_result(o) for o in outs)
+        arg = "all" if (len(target) == len(rules) and every and noun) else target[0]["id"]
+        return ai._quick_result(await ai._dispatch("auto_remove", {"rule_id": arg}, ctx))
+
     # ------------------------------------------------------------------ health report
     @commands.command(name="aicheck")
     @commands.guild_only()
@@ -464,11 +670,15 @@ class AIFix(commands.Cog):
         ]
         lines.append(f"owner protection (!guard): {ok(self.bot.get_cog('OwnerGuard'))}")
         if auto is not None:
+            import auto_cog
+
             b = auto.data["bump"]
             lines.append(
-                f"bump alert (auto_cog): {'on' if b['on'] else 'off'}, roles {len(b['roles'])}, channels {len(b['channels'])}, "
-                f"remind {b['remind']} min, rules {len(auto.data['rules'])}"
+                f"bump alert (auto_cog): {'on' if b['on'] else 'off'}, ping at every bump {'yes' if b['now'] else 'no'}, "
+                f"roles {len(b['roles'])}, channels {len(b['channels'])}, remind {b['remind']} min, rules {len(auto.data['rules'])}"
             )
+            lines.append(f"automations are saved in: {auto_cog.DATA_FILE}"
+                         + ("  (Railway volume)" if os.getenv("RAILWAY_VOLUME_MOUNT_PATH") else "  (NO volume - lost on redeploy)"))
         await ctx.reply("```\n" + "\n".join(lines) + "\n```", mention_author=False)
 
 
